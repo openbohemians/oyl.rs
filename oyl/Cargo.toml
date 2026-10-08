@@ -1,0 +1,15 @@
+[package]
+name = "oyl"
+description = "Safe Rust bindings to Oyl, a fast YAML 1.2 parser and emitter (C11, SIMD, zero-copy)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords = ["yaml", "parser", "emitter", "serialization"]
+categories = ["parser-implementations", "encoding"]
+readme = "../README.md"
+
+[dependencies]
+oyl-sys = { version = "0.1.0", path = "../oyl-sys" }
