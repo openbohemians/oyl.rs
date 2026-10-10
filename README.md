@@ -89,9 +89,15 @@ the commit they came from. To vendor another version, from a checkout of
 Oyl:
 
 ```sh
-scripts/sync-oyl.sh path/to/oyl   # copies the checkout's committed HEAD
+scripts/sync-oyl.sh path/to/oyl          # the checkout's committed HEAD
+scripts/sync-oyl.sh path/to/oyl v1.1.0   # or a release tag
 cargo test
 ```
+
+The script also sets the build metadata of `oyl-sys`'s version, the part
+after `+`, to the vendored Oyl version: `0.1.0+1.0.0` bundles Oyl 1.0.0.
+crates.io won't take two versions that differ only there, so publishing
+newly vendored sources also needs a bump before the `+`.
 
 `oyl-sys` checks that its Rust structs have the C structs' sizes and field
 offsets, so a layout change in Oyl fails its tests rather than misreading
