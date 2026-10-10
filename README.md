@@ -16,7 +16,7 @@ Two crates:
 
 ```toml
 [dependencies]
-oyl = { git = "https://github.com/openbohemians/oyl.rs" }
+oyl = "0.1"
 ```
 
 ## Parsing
