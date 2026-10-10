@@ -11,6 +11,7 @@ keywords = ["yaml", "parser", "emitter", "ffi"]
 categories = ["external-ffi-bindings", "parser-implementations"]
 links = "oyl"
 build = "build.rs"
+readme = "../README.md"
 
 [build-dependencies]
 cc = "1"
