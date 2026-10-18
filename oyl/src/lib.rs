@@ -544,7 +544,9 @@ impl fmt::Debug for Schema {
 pub enum MergeOrder {
     /// `<<` is an ordinary key.
     None,
-    /// Keys written in the mapping win (YAML's merge).
+    /// Keys written in the mapping win, then the merges: a later `<<`
+    /// over an earlier one, a sequence's earlier items over its later
+    /// ones, as in PyYAML (YAML's merge).
     Yaml,
     /// go-yaml v2's: a merge overrides the keys written before it.
     Ordered,
@@ -553,7 +555,7 @@ pub enum MergeOrder {
 /// What varies between YAML worlds: a schema (which types scalars get),
 /// syntax leniencies, and how `<<` merges. A document reads by the
 /// parser's dialect, unless it starts with `%YAML 1.1`, which chooses
-/// [`Dialect::yaml11`]: YAML 1.1 as libyaml and PyYAML read it.
+/// [`Dialect::yaml11`]: YAML 1.1 with PyYAML's types and merge.
 ///
 /// The presets are `Dialect<'static>`; a [`Tree`]'s dialect borrows from
 /// the tree (the parser may have made it from a [`Schema`] alone, and the
@@ -580,14 +582,16 @@ impl Dialect<'static> {
         Dialect::preset(unsafe { sys::oyl_dialect_yaml12() })
     }
 
-    /// YAML 1.1 as libyaml and PyYAML read it: PyYAML's types
-    /// ([`Schema::yaml11`]), YAML 1.2's syntax but for a block scalar
-    /// ending the input, which gets no final line feed (as libyaml), and
-    /// YAML's merge. Invalid YAML that libyaml accepts stays an error,
-    /// such as a comment touching a closing quote or bracket or a block
-    /// scalar's header (`"a"#c`, `[a]#c`, `|#c`), or a quoted scalar or
-    /// flow collection whose later lines are not indented past the block
-    /// it sits in.
+    /// YAML 1.1 with PyYAML's types ([`Schema::yaml11`]) and YAML's
+    /// merge: a document PyYAML reads gets the same values. Two
+    /// exceptions: ints beyond 64 bits are text, and a tree matches keys
+    /// by their text, so `yes` and `true` are two keys and `1` and `"1"`
+    /// are one. The syntax is YAML 1.2's, but a block scalar ending the
+    /// input gets no final line feed, as in libyaml. Malformed YAML that
+    /// libyaml lets through stays an error, such as a comment touching a
+    /// closing quote or bracket or a block scalar's header (`"a"#c`,
+    /// `[a]#c`, `|#c`), or a quoted scalar or flow collection whose later
+    /// lines aren't indented past the block it sits in.
     pub fn yaml11() -> Self {
         Dialect::preset(unsafe { sys::oyl_dialect_yaml11() })
     }
@@ -707,8 +711,9 @@ impl<'i> Parser<'i> {
         }
     }
 
-    /// Expand merge keys (`<<: *base`). Off by default. A merge value must
-    /// be a mapping, an alias to one, or a sequence of those.
+    /// Expand merge keys (`<<: *base`), in YAML's merge order. Off by
+    /// default. A merge value must be a mapping, an alias to one, or a
+    /// sequence of those, also through an alias.
     pub fn merge(&mut self, enable: bool) -> &mut Self {
         unsafe { sys::oyl_parser_set_merge(self.parser.as_ptr(), enable) };
         self

@@ -473,12 +473,23 @@ static bool is_merge_key(const oyl_tree *t, uint32_t k) {
     return tag.len ? same(tag, OYL_TAG_MERGE) : n->style == OYL_SCALAR_PLAIN;
 }
 
+/* What value v of a << merges: v, or under YAML's merge the sequence an
+ * alias refers to (go-yaml v2 takes only a mapping through an alias) */
+static uint32_t merge_value(const oyl_tree *t, uint32_t v) {
+    if (t->merge == OYL_MERGE_YAML && t->nodes[v].kind == OYL_NODE_ALIAS) {
+        uint32_t s = oyl_node_target(t, v);
+        if (s != NONE && t->nodes[s].kind == OYL_NODE_SEQUENCE) return s;
+    }
+    return v;
+}
+
 /* Can value v of a << in mapping m be merged? A mapping, an alias to one,
  * or a sequence of those, none of them m itself or a mapping containing
  * it. Aliases refer back, so a merge's source always ends before the
  * mapping merging it does: merges can't go round in a cycle. */
 static bool mergeable(const oyl_tree *t, uint32_t m, uint32_t v) {
     const oyl_node *n = t->nodes;
+    v = merge_value(t, v);
     bool seq = n[v].kind == OYL_NODE_SEQUENCE;
     uint32_t count = seq ? n[v].len : 1, item = seq ? v + 1 : v;
     for (uint32_t c = 0; c < count; c++, item += n[item].span) {
@@ -491,6 +502,7 @@ static bool mergeable(const oyl_tree *t, uint32_t m, uint32_t v) {
 
 /* A merge's items: the value, or a sequence's items */
 static uint32_t merge_items(const oyl_tree *t, uint32_t v, uint32_t *first) {
+    v = merge_value(t, v);
     bool seq = t->nodes[v].kind == OYL_NODE_SEQUENCE;
     *first = seq ? v + 1 : v;
     return seq ? t->nodes[v].len : 1;
@@ -538,14 +550,17 @@ static uint32_t get_in(getter *g, uint32_t m, int depth) {
         k = next;
     }
     if (found == NONE && merges && !ordered) {
-        /* YAML's merge: keys written win, then the merges in order */
+        /* YAML's merge: keys written win, then the merges, a later <<
+         * over an earlier one (as PyYAML) and a sequence's earlier items
+         * over its later ones */
         k = m + 1;
-        for (uint32_t c = 0; c < n[m].len && found == NONE; c++) {
+        for (uint32_t c = 0; c < n[m].len; c++) {
             uint32_t v = k + n[k].span, next = v + n[v].span;
             if (is_merge_key(t, k) && mergeable(t, m, v)) {
-                uint32_t item, count = merge_items(t, v, &item);
-                for (uint32_t j = 0; j < count && found == NONE; j++, item += n[item].span)
-                    found = get_in(g, oyl_node_target(t, item), depth + 1);
+                uint32_t item, count = merge_items(t, v, &item), r = NONE;
+                for (uint32_t j = 0; j < count && r == NONE; j++, item += n[item].span)
+                    r = get_in(g, oyl_node_target(t, item), depth + 1);
+                if (r != NONE) found = r;
             }
             k = next;
         }
@@ -689,7 +704,7 @@ static bool collect(collector *c, uint32_t m, int depth, bool top) {
     if (depth > MAX_MERGE_DEPTH) { c->status = OYL_ERR_LIMIT; return false; }
     bool merging = t->merge != OYL_MERGE_NONE, ordered = t->merge == OYL_MERGE_ORDERED;
     uint32_t base = c->len, pos = 0;
-    uint64_t counter = 0, group = 0;
+    uint64_t counter = 0, merged = 0;
     const uint64_t written_prio = (uint64_t)1 << 63, merged_prio = (uint64_t)1 << 62;
     uint32_t k = m + 1;
     for (uint32_t i = 0; i < n[m].len; i++) {
@@ -700,9 +715,10 @@ static bool collect(collector *c, uint32_t m, int depth, bool top) {
                 uint32_t from = c->len;
                 if (!collect(c, oyl_node_target(t, item), depth + 1, false)) return false;
                 /* go-yaml v2: a merge overrides what came before, its first
-                 * item winning; YAML: keys written win, then the merges in
-                 * order */
-                uint64_t prio = ordered ? counter + (count - j) : merged_prio - ++group;
+                 * item winning; YAML: keys written win, then the merges, a
+                 * later << over an earlier one (as PyYAML), its first item
+                 * winning */
+                uint64_t prio = ordered ? counter + (count - j) : merged_prio + merged + (count - j);
                 for (uint32_t x = from; x < c->len; x++) {
                     c->e[x].prio = prio;
                     c->e[x].pos = pos++;
@@ -710,6 +726,7 @@ static bool collect(collector *c, uint32_t m, int depth, bool top) {
                 }
             }
             if (ordered) counter += count;
+            else merged += count;
         } else {
             uint64_t prio = ordered || !merging ? ++counter : written_prio + ++counter;
             if (!push_ent(c, (ent){ k, v, prio, pos++, top })) return false;

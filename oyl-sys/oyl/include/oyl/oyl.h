@@ -462,7 +462,10 @@ OYL_API void        oyl_parser_set_schema(oyl_parser *p, const oyl_schema *schem
 
 /** Enable/disable merge key (@c <<) expansion. Disabled by default.
  *  A merge value must be a mapping, an alias to one, or a sequence of
- *  those; anything else is a OYL_ERR_PARSE. */
+ *  those, also through an alias; anything else is a OYL_ERR_PARSE. Keys
+ *  written in the mapping win, then the merges as YAML's merge orders
+ *  them (OYL_MERGE_YAML). A << whose value contains the mapping is an
+ *  ordinary key. */
 OYL_API void        oyl_parser_set_merge(oyl_parser *p, bool enable);
 
 /** Enable/disable alias resolution (inline expansion of @c *alias
@@ -526,7 +529,9 @@ enum {
 /** How << merge keys combine with the keys written in a mapping. */
 typedef enum {
     OYL_MERGE_NONE,     /**< << is an ordinary key */
-    OYL_MERGE_YAML,     /**< keys written in the mapping win (YAML 1.1's merge type) */
+    OYL_MERGE_YAML,     /**< keys written in the mapping win, then the merges: a later <<
+                             over an earlier one, a sequence's earlier items over its
+                             later ones, as in PyYAML (YAML 1.1's merge type) */
     OYL_MERGE_ORDERED,  /**< go-yaml v2: a merge overrides the keys before it */
 } oyl_merge_order;
 
@@ -539,13 +544,15 @@ OYL_API oyl_merge_order   oyl_dialect_merge(const oyl_dialect *d);
 
 /** YAML 1.2: the Core schema, YAML 1.2's syntax, YAML's merge. */
 OYL_API const oyl_dialect *oyl_dialect_yaml12(void);
-/** YAML 1.1 as libyaml and PyYAML read it: PyYAML's types
- *  (oyl_schema_yaml11), YAML 1.2's syntax but for a block scalar ending
- *  the input, which gets no final line feed, and YAML's merge. Invalid
- *  YAML that libyaml accepts stays an error, such as a comment touching
- *  a closing quote or bracket or a block scalar's header ("a"#c, [a]#c,
- *  |#c), or a quoted scalar or flow collection whose later lines are not
- *  indented past the block it sits in. */
+/** YAML 1.1 with PyYAML's types (oyl_schema_yaml11) and YAML's merge: a
+ *  document PyYAML reads gets the same values. Two exceptions: ints
+ *  beyond 64 bits are text, and a tree matches keys by their text, so yes
+ *  and true are two keys and 1 and "1" are one. The syntax is YAML 1.2's,
+ *  but a block scalar ending the input gets no final line feed, as in
+ *  libyaml. Malformed YAML that libyaml lets through stays an error, such
+ *  as a comment touching a closing quote or bracket or a block scalar's
+ *  header ("a"#c, [a]#c, |#c), or a quoted scalar or flow collection
+ *  whose later lines aren't indented past the block it sits in. */
 OYL_API const oyl_dialect *oyl_dialect_yaml11(void);
 /** go-yaml v2, as Kubernetes reads YAML: its types, its syntax
  *  leniencies (OYL_SYNTAX_GOYAML2), and its merge order. */
@@ -742,7 +749,8 @@ OYL_API uint32_t oyl_node_target(const oyl_tree *t, uint32_t i);
  *  OYL_NO_NODE. Keys are scalars matched by their text, plain or quoted;
  *  a key written twice gives its last value; << merges apply in the
  *  order of the document's dialect. A << whose value can't be merged (not
- *  a mapping, an alias to one, or a sequence of those) is an ordinary key. */
+ *  a mapping, an alias to one, or a sequence of those, which YAML's merge
+ *  also takes through an alias) is an ordinary key. */
 OYL_API uint32_t oyl_node_get(const oyl_tree *t, uint32_t map, oyl_str key);
 
 /** Item @p k of sequence @p seq (or an alias to one), or OYL_NO_NODE. */

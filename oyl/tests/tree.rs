@@ -133,6 +133,20 @@ fn merges_in_each_dialects_order() {
 }
 
 #[test]
+fn merges_as_pyyaml_does_them() {
+    // a later << wins over an earlier one; an alias to a sequence merges as the sequence
+    let input = "%YAML 1.1\n---\na: &a {x: a, y: a}\nb: &b {x: b, z: b}\nl: &l [*a, *b]\n\
+                 two:\n  <<: *a\n  <<: *b\nlist:\n  <<: *l\n";
+    let tree = tree_of(input);
+    let two = tree.root().get("two").unwrap();
+    assert_eq!(two.get("x").unwrap().text(), b"b");
+    assert_eq!(two.get("y").unwrap().text(), b"a");
+    let list = tree.root().get("list").unwrap();
+    let entries: Vec<_> = list.entries().unwrap().iter().map(|(k, v)| (k.text_str().unwrap(), v.text_str().unwrap())).collect();
+    assert_eq!(entries, [("x", "a"), ("y", "a"), ("z", "b")]);
+}
+
+#[test]
 fn strict_entries_name_the_repeated_key() {
     let tree = tree_of("a: 1\nb: 2\na: 3\n");
     assert_eq!(tree.root().get("a").unwrap().text(), b"3");

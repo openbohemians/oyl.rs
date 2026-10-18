@@ -290,6 +290,18 @@ fn keys_written_twice() {
     assert_eq!(m["m"]["x"], 1);
     let m: HashMap<String, HashMap<String, i32>> = oyl::from_str_with(input, Dialect::goyaml2()).unwrap();
     assert_eq!(m["m"]["y"], 2);
+    // nor are two <<: the later wins, as in PyYAML; an alias to a sequence merges as the sequence
+    let input = "%YAML 1.1\n---\na: &a {x: a, y: a}\nb: &b {x: b, z: b}\nl: &l [*a, *b]\n\
+                 two:\n  <<: *a\n  <<: *b\nlist:\n  <<: *l\n";
+    #[derive(Deserialize)]
+    struct Merged {
+        two: BTreeMap<String, String>,
+        list: BTreeMap<String, String>,
+    }
+    let m: Merged = oyl::from_str(input).unwrap();
+    let abc = |x: &str, y: &str, z: &str| BTreeMap::from([("x".into(), x.into()), ("y".into(), y.into()), ("z".into(), z.into())]);
+    assert_eq!(m.two, abc("b", "a", "b"));
+    assert_eq!(m.list, abc("a", "a", "b"));
 }
 
 #[test]

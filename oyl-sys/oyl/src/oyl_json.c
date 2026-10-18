@@ -664,13 +664,22 @@ static bool merge_ordered(doc *d, uint32_t value, uint64_t *counter) {
     return ok;
 }
 
-/* YAML's merge, in collect_merged: keys written in a mapping win, then the
- * merges in order, a sequence's items in order. Each merged mapping is
+/* YAML's merge, from collect: keys written in a mapping win, then the
+ * merges, a later << over an earlier one (as PyYAML; collect takes them
+ * from the last), a sequence's items in order. Each merged mapping is
  * settled first (its own merges included), then fills the keys not yet
  * set, at a lower priority than everything before it. */
 static bool settle(doc *d, size_t base, size_t *count);
 
 static bool merge_by_yaml(doc *d, uint32_t value, uint64_t *group) {
+    if (d->n[value].kind == OYL_NODE_ALIAS && d->n[d->n[value].props].kind == OYL_NODE_SEQUENCE) {
+        /* an alias to a sequence of mappings merges as the sequence */
+        if (!count_decode(d, value)) return false;
+        d->alias_depth++;
+        bool ok = merge_by_yaml(d, d->n[value].props, group);
+        d->alias_depth--;
+        return ok;
+    }
     bool is_seq = d->n[value].kind == OYL_NODE_SEQUENCE;
     if (is_seq && !count_decode(d, value)) return false;
     uint32_t items = is_seq ? d->n[value].len : 1, item = is_seq ? value + 1 : value;
@@ -725,7 +734,7 @@ static bool collect(doc *d, uint32_t map, uint64_t *counter, bool written) {
         e.prio = ordered || !merging ? ++*counter : ((uint64_t)1 << 63) + ++*counter;
         if (!push_entry(d, e)) return false;
     }
-    for (size_t j = 0; j < npending; j++)
+    for (size_t j = npending; j-- > 0;)
         if (!merge_by_yaml(d, pending_merges[j], &group)) return false;
     return true;
 }

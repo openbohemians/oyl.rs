@@ -143,9 +143,10 @@ serde_yaml was archived in 2024.
 ## Dialects
 
 A dialect decides which types scalars get and how `<<` merges: YAML 1.2's
-core schema by default; YAML 1.1 as libyaml and PyYAML read it (`yes` and
-`on` are booleans, `0777` is octal); or go-yaml v2's, as Kubernetes reads
-YAML. A document starting with `%YAML 1.1` reads as YAML 1.1.
+core schema by default; YAML 1.1 with PyYAML's types and merge (`yes` and
+`on` are booleans, `0777` is octal), so a document PyYAML reads gets the
+same values (with two exceptions, in `Dialect::yaml11`'s docs); or go-yaml
+v2's, as Kubernetes reads YAML. A document starting with `%YAML 1.1` reads as YAML 1.1.
 
 ```rust
 use oyl::{Dialect, Parser, Value};

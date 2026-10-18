@@ -1,1 +1,1 @@
-557b676440a246a30718674bf0da21ec4a3d12eb 2026-10-18 oyl.h: what libyaml accepts that the YAML 1.1 dialect doesn't
+5c121362ff33ceca27d3b3b0495ba97483285ef6 2026-10-18 Merges as PyYAML does them; YAML 1.1 is PyYAML's types and merge
