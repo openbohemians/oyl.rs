@@ -79,6 +79,11 @@ struct oyl_scanner {
     int          props_col;        /* 0-based column where that run starts */
     size_t       indicator_end;    /* offset just past the last block - ? : */
 
+    /* the document's syntax leniencies (OYL_SYNTAX_), and where to warn
+     * when one changes the result */
+    unsigned        syntax;
+    oyl_warn_state *warn;
+
     /* error context */
     char      error_msg[256];
     oyl_mark  error_mark;
@@ -786,6 +791,17 @@ static oyl_status scan_double_quoted(oyl_scanner *s, oyl_token *tok) {
                 case '"':  buf[out++] = '"'; break;
                 case '/':  buf[out++] = '/'; break;
                 case '\\': buf[out++] = '\\'; break;
+                case '\'':  /* libyaml's: not a YAML 1.2 escape */
+                    if (!(s->syntax & OYL_SYNTAX_SQUOTE_ESCAPE)) SCAN_ERROR(s, "invalid escape sequence");
+                    buf[out++] = '\'';
+                    if (s->warn) {
+                        oyl_mark at = mark(s);
+                        at.offset -= 2;
+                        at.col -= 2;
+                        oyl_warn(s->warn, OYL_WARN_LENIENCY, at,
+                                 "\\' in double quotes is not a YAML 1.2 escape (read as ')");
+                    }
+                    break;
                 case 'N':  /* NEL U+0085 — encode as UTF-8 */
                     buf[out++] = (char)0xC2;
                     buf[out++] = (char)0x85;
@@ -800,7 +816,13 @@ static oyl_status scan_double_quoted(oyl_scanner *s, oyl_token *tok) {
                     if (!oyl_is_hex(hi) || !oyl_is_hex(lo)) SCAN_ERROR(s, "invalid hex digit in \\x escape");
                     uint8_t byte = (hex_digit(hi) << 4) | hex_digit(lo);
                     advance(s, 2);
-                    buf[out++] = (char)byte;
+                    /* the code point U+00NN, in UTF-8: \xB5 is µ (C2 B5) */
+                    if (byte < 0x80) {
+                        buf[out++] = (char)byte;
+                    } else {
+                        buf[out++] = (char)(0xC0 | (byte >> 6));
+                        buf[out++] = (char)(0x80 | (byte & 0x3F));
+                    }
                     break;
                 }
                 case 'u': /* \uNNNN */
@@ -998,6 +1020,10 @@ static bool at_doc_indicator(oyl_scanner *s, char ch) {
 /* ── Main scan function ──────────────────────────────────── */
 
 oyl_scanner *oyl_scanner_new(const char *input, size_t len, oyl_arena *a) {
+    if (!input) {   /* no input is empty text, so offsets aren't taken from NULL */
+        if (len) return NULL;
+        input = "";
+    }
     oyl_scanner *s = (oyl_scanner *)malloc(sizeof(oyl_scanner));
     if (!s) return NULL;
 
@@ -1448,6 +1474,9 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
             if (!lines) return OYL_ERR_MEMORY;
         }
 
+        /* whether the last line ended with a break: at the end of the input
+         * it may not (see OYL_SYNTAX_EOF_NO_BREAK) */
+        bool terminated = true;
         while (s->pos < end_pos) {
             int li = 0;
             while (s->pos + li < s->len && s->buf[s->pos + li] == ' ') li++;
@@ -1460,7 +1489,8 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
                 }
                 buf[out++] = '\n';
                 advance_cols(s, (size_t)li);
-                if (!AT_END(s) && oyl_is_break(PEEK(s))) skip_break(s);
+                terminated = !AT_END(s) && oyl_is_break(PEEK(s));
+                if (terminated) skip_break(s);
                 continue;
             }
             /* whitespace-only lines ABOVE base indent (li > base_indent)
@@ -1489,7 +1519,8 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
             }
 
             buf[out++] = '\n';
-            if (!AT_END(s) && oyl_is_break(PEEK(s))) skip_break(s);
+            terminated = !AT_END(s) && oyl_is_break(PEEK(s));
+            if (terminated) skip_break(s);
         }
 
         /* apply folding for '>' style */
@@ -1553,6 +1584,12 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
             out = fout;
         }
 
+        /* libyaml's: a last line ending the input without a break gives no
+         * line feed; YAML 1.2 (and its test suite) gives one */
+        bool eof_lenient = !terminated && (s->syntax & OYL_SYNTAX_EOF_NO_BREAK) && chomp != -1;
+        bool dropped = false;
+        if (eof_lenient && out > 0 && buf[out - 1] == '\n') { out--; dropped = true; }
+
         /* apply chomping to trailing newlines */
         if (chomp == -1) {
             /* strip: remove all trailing newlines */
@@ -1567,11 +1604,16 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
             }
             if (!has_content) {
                 out = 0;
+                dropped = false;
             } else {
                 while (out > 1 && buf[out - 1] == '\n' && buf[out - 2] == '\n') out--;
-                if (out > 0 && buf[out - 1] != '\n') buf[out++] = '\n';
+                if (!eof_lenient && out > 0 && buf[out - 1] != '\n') buf[out++] = '\n';
             }
         }
+        if (dropped && s->warn)
+            oyl_warn(s->warn, OYL_WARN_LENIENCY, start,
+                     "block scalar ending the input without a line break: no final line feed, "
+                     "as libyaml reads it (YAML 1.2 gives one)");
         /* keep (chomp == 1): preserve all trailing newlines as-is */
 
         buf[out] = '\0';
@@ -1606,6 +1648,11 @@ oyl_mark oyl_scanner_error_mark(oyl_scanner *s) {
  * the parser can rewind to. dst keeps its own stack buffers, growing them
  * as needed; if one can't grow, dst's state is unchanged and this returns
  * false. */
+void oyl_scanner_set_syntax(oyl_scanner *s, unsigned syntax, oyl_warn_state *w) {
+    s->syntax = syntax;
+    s->warn = w;
+}
+
 bool oyl_scanner_copy(oyl_scanner *dst, const oyl_scanner *src) {
     if (dst->indents.cap < src->indents.len) {
         int *d = realloc(dst->indents.data, (size_t)src->indents.cap * sizeof *d);

@@ -16,5 +16,14 @@ const size_t oyl_sys_layout[] = {
     offsetof(oyl_event, flow), offsetof(oyl_event, start),
     offsetof(oyl_event, end),
     sizeof(oyl_status), sizeof(oyl_event_type),
+    sizeof(oyl_value), offsetof(oyl_value, kind), offsetof(oyl_value, as),
+    sizeof(oyl_node), offsetof(oyl_node, text), offsetof(oyl_node, len),
+    offsetof(oyl_node, span), offsetof(oyl_node, parent), offsetof(oyl_node, props),
+    offsetof(oyl_node, start), offsetof(oyl_node, end), offsetof(oyl_node, kind),
+    offsetof(oyl_node, style), offsetof(oyl_node, type), offsetof(oyl_node, flags),
+    sizeof(oyl_node_props), offsetof(oyl_node_props, tag),
+    offsetof(oyl_node_props, tag_len), offsetof(oyl_node_props, anchor),
+    offsetof(oyl_node_props, anchor_len),
+    sizeof(oyl_pair), offsetof(oyl_pair, key), offsetof(oyl_pair, value),
 };
 const size_t oyl_sys_layout_len = sizeof oyl_sys_layout / sizeof oyl_sys_layout[0];

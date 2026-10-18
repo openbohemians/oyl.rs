@@ -114,6 +114,22 @@ struct oyl_parser {
 
     /* schema (optional, for tag resolution) */
     const oyl_schema *schema;
+    const oyl_schema *res_schema;   /* the current document's, when resolving */
+
+    /* dialects: the default, those documents may choose by directive, and
+     * the current document's */
+    const oyl_dialect *default_dialect;   /* NULL: YAML 1.2, with `schema` if set */
+    oyl_dialect        schema_dialect;    /* that default when only a schema is set */
+    struct { char version[16]; const oyl_dialect *d; } dialect_versions[8];
+    int                n_dialect_versions;
+    struct { char prefix[256]; const oyl_dialect *d; } dialect_prefixes[8];
+    int                n_dialect_prefixes;
+    const oyl_dialect *doc_dialect;
+    bool               doc_has_version;   /* the document's %YAML, if it has one */
+    int                doc_major, doc_minor;
+    oyl_mark           yaml_dir_mark;
+
+    oyl_warn_state warn;
 
     /* merge key resolution (opt-in) */
     bool merge_enabled;
@@ -238,13 +254,13 @@ static inline bool enqueue(oyl_parser *p, const oyl_event *evt) {
     oyl_event *dst = &p->events[p->evt_len++];
     *dst = *evt;
     /* resolve tag via schema if set and no explicit tag */
-    if (p->schema && dst->tag.data == NULL) {
+    if (p->res_schema && dst->tag.data == NULL) {
         if (dst->type == OYL_EVT_SCALAR)
-            dst->tag = oyl_schema_resolve(p->schema, dst->value, dst->scalar_style);
+            dst->tag = oyl_schema_resolve(p->res_schema, dst->value, dst->scalar_style);
         else if (dst->type == OYL_EVT_MAPPING_START)
-            dst->tag = p->schema->default_map_tag;
+            dst->tag = p->res_schema->default_map_tag;
         else if (dst->type == OYL_EVT_SEQUENCE_START)
-            dst->tag = p->schema->default_seq_tag;
+            dst->tag = p->res_schema->default_seq_tag;
     }
     return true;
 }
@@ -389,9 +405,9 @@ static void move_props_to_key_map(oyl_parser *p, int at, oyl_event *map_evt,
     map_evt->tag = tag;         /* insert_event applies the schema default */
     coll->anchor = OYL_STR_NULL;
     coll->tag = OYL_STR_NULL;
-    if (p->schema)
-        coll->tag = coll->type == OYL_EVT_MAPPING_START ? p->schema->default_map_tag
-                                                        : p->schema->default_seq_tag;
+    if (p->res_schema)
+        coll->tag = coll->type == OYL_EVT_MAPPING_START ? p->res_schema->default_map_tag
+                                                        : p->res_schema->default_seq_tag;
     coll->start = coll_start;
 }
 
@@ -1896,6 +1912,18 @@ static oyl_status parse_directive(oyl_parser *p, bool *had_yaml) {
         while (i < l1 && w1[i] >= '0' && w1[i] <= '9') i++;
         if (i != l1 || i == dot + 1)
             PARSE_ERROR(p, "invalid %YAML version");
+        /* only major version 1: the spec rejects a higher one, and for a
+         * lower one follows libyaml, which rejects it too */
+        size_t z = 0;
+        while (z + 1 < dot && w1[z] == '0') z++;
+        if (dot - z != 1 || w1[z] != '1')
+            PARSE_ERROR(p, "unsupported %YAML version: only 1.x is accepted");
+        int minor = 0;
+        for (size_t k = dot + 1; k < l1; k++) minor = minor < 100000 ? minor * 10 + (w1[k] - '0') : minor;
+        p->doc_has_version = true;
+        p->doc_major = 1;
+        p->doc_minor = minor;
+        p->yaml_dir_mark = p->current.start;
         if (directive_word(&cur, end, &extra, &lx))
             PARSE_ERROR(p, "unexpected text after %YAML version");
         return OYL_OK;
@@ -1940,15 +1968,96 @@ static oyl_status parse_directive(oyl_parser *p, bool *had_yaml) {
     return OYL_OK;
 }
 
+/* ── Dialects ────────────────────────────────────────────── */
+
+void oyl_warn(oyl_warn_state *w, oyl_warning code, oyl_mark mark, const char *msg) {
+    if (!w->fn) return;
+    unsigned c = (unsigned)code & 7;
+    if (w->seen[c] && mark.offset <= w->last[c]) return;   /* re-read input */
+    w->seen[c] = true;
+    w->last[c] = mark.offset;
+    w->fn(w->user, code, mark, msg);
+}
+
+void oyl_parser_warn(oyl_parser *p, oyl_warning code, oyl_mark mark, const char *msg) {
+    if (p->warn.fn) p->warn.fn(p->warn.user, code, mark, msg);
+}
+
+static const oyl_dialect *default_dialect(oyl_parser *p) {
+    if (p->default_dialect) return p->default_dialect;
+    if (p->schema) {
+        p->schema_dialect = (oyl_dialect){ .schema = p->schema, .syntax = 0, .merge = OYL_MERGE_YAML };
+        return &p->schema_dialect;
+    }
+    return oyl_dialect_yaml12();
+}
+
+/* Make `d` the current document's dialect: its syntax for the scanner, its
+ * schema for tag resolution (if on) */
+static void use_dialect(oyl_parser *p, const oyl_dialect *d) {
+    p->doc_dialect = d;
+    oyl_scanner_set_syntax(p->scanner, d->syntax, &p->warn);
+    p->res_schema = p->schema ? oyl_dialect_schema(d) : NULL;
+}
+
+/* After a document's directives: its %TAG !! prefix, if a dialect is
+ * registered for it, else its %YAML version, else the default */
+static oyl_status select_dialect(oyl_parser *p) {
+    const oyl_dialect *d = NULL;
+    char msg[320];
+    for (int i = 0; i < p->tag_dir_count && !d; i++) {
+        if (strcmp(p->tag_directives[i].handle, "!!") != 0) continue;
+        const char *prefix = p->tag_directives[i].prefix;
+        for (int j = 0; j < p->n_dialect_prefixes && !d; j++)
+            if (strcmp(p->dialect_prefixes[j].prefix, prefix) == 0) d = p->dialect_prefixes[j].d;
+        if (!d && strcmp(prefix, "tag:yaml.org,2002:") != 0) {
+            snprintf(msg, sizeof msg, "no dialect registered for %%TAG !! %s: untagged values "
+                     "keep the standard types", prefix);
+            oyl_warn(&p->warn, OYL_WARN_DIALECT, p->current.start, msg);
+        }
+    }
+    if (!d && p->doc_has_version) {
+        char v[24];
+        snprintf(v, sizeof v, "%d.%d", p->doc_major, p->doc_minor);
+        for (int j = 0; j < p->n_dialect_versions && !d; j++)
+            if (strcmp(p->dialect_versions[j].version, v) == 0) d = p->dialect_versions[j].d;
+        if (!d && p->doc_minor == 1) d = oyl_dialect_yaml11();
+        if (!d) {
+            d = oyl_dialect_yaml12();
+            if (p->doc_minor != 2) {
+                snprintf(msg, sizeof msg, "%%YAML %s: read as YAML 1.2", v);
+                oyl_warn(&p->warn, OYL_WARN_YAML_VERSION, p->yaml_dir_mark, msg);
+            }
+        }
+    }
+    if (!d) d = default_dialect(p);
+    use_dialect(p, d);
+    /* a world that takes %YAML 1.1 only, by the document's dialect or the
+     * default (go-yaml v2's), rejects any other version */
+    if (((d->syntax | default_dialect(p)->syntax) & OYL_SYNTAX_YAML11_ONLY) && p->doc_has_version &&
+        !(p->doc_major == 1 && p->doc_minor == 1)) {
+        p->error_mark = p->yaml_dir_mark;
+        snprintf(p->error_msg, sizeof p->error_msg,
+                 "found incompatible YAML document: the dialect takes %%YAML 1.1 only");
+        return OYL_ERR_PARSE;
+    }
+    return OYL_OK;
+}
+
 static oyl_status parse_document(oyl_parser *p) {
     if (p->oom) return OOM_STATUS(p);
+    /* a document without directives has the default dialect; the tokens
+     * before a dialect is chosen (directives, ---) read alike in all */
+    use_dialect(p, default_dialect(p));
     oyl_status st = peek_token(p);
     if (st != OYL_OK) return st;
 
     /* a new document starts here (unless this is only a '...' or the end
      * of the stream); %TAG handles apply to the next document only */
-    if (tok_type(p) != OYL_TOK_DOC_END && tok_type(p) != OYL_TOK_STREAM_END)
+    if (tok_type(p) != OYL_TOK_DOC_END && tok_type(p) != OYL_TOK_STREAM_END) {
         p->tag_dir_count = 0;
+        p->doc_has_version = false;
+    }
 
     /* directives (%YAML, %TAG) */
     bool had_directive = false, had_yaml = false;
@@ -1964,6 +2073,10 @@ static oyl_status parse_document(oyl_parser *p) {
     }
     if (had_directive && tok_type(p) != OYL_TOK_DOC_START)
         PARSE_ERROR(p, "directives must be followed by a document start marker '---'");
+    if (had_directive) {
+        st = select_dialect(p);
+        if (st != OYL_OK) return st;
+    }
 
     if (tok_type(p) == OYL_TOK_DOC_START) {
         /* explicit doc start */
@@ -2818,12 +2931,16 @@ ALWAYS_INLINE int fk_quote_kind(const char *input, size_t i, size_t qend) {
     char c = input[i - 1];          /* i > 0: the scan starts at a bracket */
     if (c != ' ' && c != '\t') {
         /* directly after an entry start, or after a value ':' that
-         * follows a closed scalar or collection ({"a":"b"}, [a]:'b') */
+         * follows a closed scalar or collection, blanks allowed between
+         * ({"a":"b"}, [a]:'b', ['a' :'b']) */
         if (c == '[' || c == '{' || c == ',') return 1;
-        if (c == ':' && i >= 2 &&
-            (((input[i - 2] == '"' || input[i - 2] == '\'') && i - 1 == qend) ||
-             input[i - 2] == ']' || input[i - 2] == '}'))
-            return 1;
+        if (c == ':' && i >= 2) {
+            size_t k = i - 2;
+            while (k > 0 && (input[k] == ' ' || input[k] == '\t')) k--;
+            if (((input[k] == '"' || input[k] == '\'') && k + 1 == qend) ||
+                input[k] == ']' || input[k] == '}')
+                return 1;
+        }
         /* inside a word: plain text, or a tag or anchor name, since a
          * quoted scalar only starts a token */
         return 0;
@@ -2844,10 +2961,9 @@ static bool fk_colon_follows(const char *input, size_t len, size_t i) {
     for (size_t j = i + 1; j < len; j++) {
         char nc = input[j];
         if (nc == ' ' || nc == '\t' || nc == '\n' || nc == '\r') continue;
-        if (nc == '#') {
-            const char *nl = memchr(input + j, '\n', len - j);
-            if (!nl) return false;
-            j = (size_t)(nl - input);
+        if (nc == '#') {   /* a comment runs to a line break: \n or \r */
+            while (j < len && input[j] != '\n' && input[j] != '\r') j++;
+            if (j == len) return false;
             continue;
         }
         return nc == ':';
@@ -2967,11 +3083,12 @@ static bool fk_scan(oyl_parser *p, size_t offset) {
             }
             break;
         case '#':
-            /* a comment runs to the next \n, which it consumes */
+            /* a comment runs to the next line break (\n or \r, which
+             * the scanner takes as one too), and consumes it */
             if (i > 0 && (input[i - 1] == ' ' || input[i - 1] == '\t' ||
                           input[i - 1] == '\n' || input[i - 1] == '\r')) {
                 size_t k;
-                while ((k = fk_next(&cur)) != len && input[k] != '\n') {}
+                while ((k = fk_next(&cur)) != len && input[k] != '\n' && input[k] != '\r') {}
                 if (k == len) goto unterminated;
             }
             break;
@@ -4475,6 +4592,10 @@ static oyl_status parser_step(oyl_parser *p) {
 /* ── Public API ──────────────────────────────────────────── */
 
 oyl_parser *oyl_parser_new(const char *input, size_t len, oyl_arena *a) {
+    if (!input) {   /* as in oyl_scanner_new */
+        if (len) return NULL;
+        input = "";
+    }
     oyl_parser *p = calloc(1, sizeof(oyl_parser));
     if (!p) return NULL;
 
@@ -4515,6 +4636,7 @@ oyl_parser *oyl_parser_new(const char *input, size_t len, oyl_arena *a) {
     /* incremental state machine — use eager mode when merge/alias needed */
     p->incremental = true;
     p->state = ST_STREAM_START;
+    p->doc_dialect = oyl_dialect_yaml12();
     p->frame_cap = 16;
     p->frames = malloc(p->frame_cap * sizeof(state_frame));
     if (!p->frames) {
@@ -4712,7 +4834,58 @@ void oyl_parser_set_schema(oyl_parser *p, const oyl_schema *schema) {
     if (p) {
         p->schema = schema;
         if (schema) p->incremental = false;
+        use_dialect(p, default_dialect(p));
     }
+}
+
+void oyl_parser_set_dialect(oyl_parser *p, const oyl_dialect *d) {
+    if (!p) return;
+    p->default_dialect = d;
+    use_dialect(p, default_dialect(p));
+}
+
+oyl_status oyl_parser_add_dialect(oyl_parser *p, const oyl_dialect *d, const char *version,
+                                  const char *tag_prefix) {
+    if (!p || !d || (version == NULL) == (tag_prefix == NULL)) return OYL_ERR_INPUT;
+    if (version) {
+        if (strlen(version) >= sizeof p->dialect_versions[0].version) return OYL_ERR_INPUT;
+        for (int i = 0; i < p->n_dialect_versions; i++)
+            if (strcmp(p->dialect_versions[i].version, version) == 0) {
+                p->dialect_versions[i].d = d;
+                return OYL_OK;
+            }
+        if (p->n_dialect_versions == 8) return OYL_ERR_LIMIT;
+        strcpy(p->dialect_versions[p->n_dialect_versions].version, version);
+        p->dialect_versions[p->n_dialect_versions++].d = d;
+    } else {
+        if (strlen(tag_prefix) >= sizeof p->dialect_prefixes[0].prefix) return OYL_ERR_INPUT;
+        for (int i = 0; i < p->n_dialect_prefixes; i++)
+            if (strcmp(p->dialect_prefixes[i].prefix, tag_prefix) == 0) {
+                p->dialect_prefixes[i].d = d;
+                return OYL_OK;
+            }
+        if (p->n_dialect_prefixes == 8) return OYL_ERR_LIMIT;
+        strcpy(p->dialect_prefixes[p->n_dialect_prefixes].prefix, tag_prefix);
+        p->dialect_prefixes[p->n_dialect_prefixes++].d = d;
+    }
+    return OYL_OK;
+}
+
+const oyl_dialect *oyl_parser_document_dialect(oyl_parser *p) {
+    return p ? p->doc_dialect : NULL;
+}
+
+bool oyl_parser_yaml_version(oyl_parser *p, int *major, int *minor) {
+    if (!p || !p->doc_has_version) return false;
+    if (major) *major = p->doc_major;
+    if (minor) *minor = p->doc_minor;
+    return true;
+}
+
+void oyl_parser_set_warn(oyl_parser *p, oyl_warn_fn fn, void *user) {
+    if (!p) return;
+    p->warn.fn = fn;
+    p->warn.user = user;
 }
 
 void oyl_parser_set_merge(oyl_parser *p, bool enable) {
@@ -4736,6 +4909,23 @@ void oyl_parser_set_max_events(oyl_parser *p, int max) {
 void oyl_parser_set_max_depth(oyl_parser *p, int max) {
     if (p) p->max_depth = max;
 }
+
+void oyl_parser_fail(oyl_parser *p, oyl_mark mark, const char *msg) {
+    snprintf(p->error_msg, sizeof(p->error_msg), "%s", msg);
+    p->error_mark = mark;
+}
+
+oyl_arena *oyl_parser_arena(const oyl_parser *p) { return p->arena; }
+bool oyl_parser_owns_dialect(const oyl_parser *p, const oyl_dialect *d) {
+    return d == &p->schema_dialect;
+}
+
+const char *oyl_parser_input(const oyl_parser *p, size_t *len) {
+    *len = p->input_len;
+    return p->input;
+}
+int oyl_parser_depth_limit(const oyl_parser *p) { return p->max_depth > 0 ? p->max_depth : 0; }
+const oyl_schema *oyl_parser_schema(const oyl_parser *p) { return p->res_schema; }
 
 const char *oyl_parser_error(oyl_parser *p) {
     if (!p || p->error_msg[0] == '\0') return NULL;
