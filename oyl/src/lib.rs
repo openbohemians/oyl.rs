@@ -583,8 +583,11 @@ impl Dialect<'static> {
     /// YAML 1.1 as libyaml and PyYAML read it: PyYAML's types
     /// ([`Schema::yaml11`]), YAML 1.2's syntax but for a block scalar
     /// ending the input, which gets no final line feed (as libyaml), and
-    /// YAML's merge. libyaml's acceptance of some invalid YAML (tabs as
-    /// indentation) isn't taken on.
+    /// YAML's merge. Invalid YAML that libyaml accepts stays an error,
+    /// such as a comment touching a closing quote or bracket or a block
+    /// scalar's header (`"a"#c`, `[a]#c`, `|#c`), or a quoted scalar or
+    /// flow collection whose later lines are not indented past the block
+    /// it sits in.
     pub fn yaml11() -> Self {
         Dialect::preset(unsafe { sys::oyl_dialect_yaml11() })
     }

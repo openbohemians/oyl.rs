@@ -1,1 +1,1 @@
-73c5f673d1f8e64fe675f1927e1574bdcbcc6064 2026-10-18 YAML 1.1 as libyaml and PyYAML read it, not as yaml.org/type has it
+557b676440a246a30718674bf0da21ec4a3d12eb 2026-10-18 oyl.h: what libyaml accepts that the YAML 1.1 dialect doesn't

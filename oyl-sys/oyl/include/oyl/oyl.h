@@ -541,9 +541,11 @@ OYL_API oyl_merge_order   oyl_dialect_merge(const oyl_dialect *d);
 OYL_API const oyl_dialect *oyl_dialect_yaml12(void);
 /** YAML 1.1 as libyaml and PyYAML read it: PyYAML's types
  *  (oyl_schema_yaml11), YAML 1.2's syntax but for a block scalar ending
- *  the input, which gets no final line feed, and YAML's merge. libyaml's
- *  acceptance of some invalid YAML (tabs as indentation, # right after
- *  text) isn't taken on. */
+ *  the input, which gets no final line feed, and YAML's merge. Invalid
+ *  YAML that libyaml accepts stays an error, such as a comment touching
+ *  a closing quote or bracket or a block scalar's header ("a"#c, [a]#c,
+ *  |#c), or a quoted scalar or flow collection whose later lines are not
+ *  indented past the block it sits in. */
 OYL_API const oyl_dialect *oyl_dialect_yaml11(void);
 /** go-yaml v2, as Kubernetes reads YAML: its types, its syntax
  *  leniencies (OYL_SYNTAX_GOYAML2), and its merge order. */
