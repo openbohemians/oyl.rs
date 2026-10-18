@@ -275,3 +275,31 @@ fn dialects() {
     assert_eq!(Dialect::goyaml2().schema().resolve(b"yes", ScalarStyle::Plain), b"tag:yaml.org,2002:bool");
     assert_eq!(Schema::yaml11().resolve(b"0b101", ScalarStyle::Plain), b"tag:yaml.org,2002:int");
 }
+
+#[test]
+fn keys_compare_by_tag_and_value() {
+    let tree = tree_of("1: int\n\"1\": str\n0x2: a\n2: b\ntrue: c\nTrue: d\n");
+    let root = tree.root();
+    let keys: Vec<_> = root.entries().unwrap().iter().map(|(k, v)| (k.text_str().unwrap(), v.text_str().unwrap())).collect();
+    assert_eq!(keys, [("1", "int"), ("1", "str"), ("2", "b"), ("True", "d")]);
+    // by text, the string first; by value, as YAML compares keys
+    assert_eq!(root.get("1").unwrap().text(), b"str");
+    assert_eq!(root.get("0x2").unwrap().text(), b"b");
+    assert_eq!(root.get_value(Value::Int(1)).unwrap().text(), b"int");
+    assert_eq!(root.get_value(Value::Str(b"1")).unwrap().text(), b"str");
+    assert_eq!(root.get_value(Value::Bool(true)).unwrap().text(), b"d");
+    assert!(root.get_value(Value::Null).is_none());
+    // 0x2 and 2 repeat, as do true and True; 1 and "1" don't
+    let e = root.entries_strict().unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Parse);
+    assert_eq!(e.mark().unwrap().line, 4);
+    assert!(tree_of("1: a\n\"1\": b\n").root().entries_strict().is_ok());
+
+    // YAML 1.1's types make more keys one
+    let mut parser = Parser::new("yes: a\non: b\ny: c\n").unwrap();
+    parser.dialect(Dialect::yaml11());
+    let tree = parser.next_tree().unwrap().unwrap();
+    assert_eq!(tree.root().entries().unwrap().len(), 2);
+    assert_eq!(tree.root().get("yes").unwrap().text(), b"b");
+    assert_eq!(tree.root().get_value(Value::Bool(true)).unwrap().text(), b"b");
+}

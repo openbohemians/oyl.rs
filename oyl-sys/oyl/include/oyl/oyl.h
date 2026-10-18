@@ -464,8 +464,9 @@ OYL_API void        oyl_parser_set_schema(oyl_parser *p, const oyl_schema *schem
  *  A merge value must be a mapping, an alias to one, or a sequence of
  *  those, also through an alias; anything else is a OYL_ERR_PARSE. Keys
  *  written in the mapping win, then the merges as YAML's merge orders
- *  them (OYL_MERGE_YAML). A << whose value contains the mapping is an
- *  ordinary key. */
+ *  them (OYL_MERGE_YAML), keys compared by tag and value in the
+ *  document's schema (0x1 is 1, "1" isn't). A << whose value contains
+ *  the mapping is an ordinary key. */
 OYL_API void        oyl_parser_set_merge(oyl_parser *p, bool enable);
 
 /** Enable/disable alias resolution (inline expansion of @c *alias
@@ -546,8 +547,9 @@ OYL_API oyl_merge_order   oyl_dialect_merge(const oyl_dialect *d);
 OYL_API const oyl_dialect *oyl_dialect_yaml12(void);
 /** YAML 1.1 with PyYAML's types (oyl_schema_yaml11) and YAML's merge: a
  *  document PyYAML reads gets the same values. Two exceptions: ints
- *  beyond 64 bits are text, and a tree matches keys by their text, so yes
- *  and true are two keys and 1 and "1" are one. The syntax is YAML 1.2's,
+ *  beyond 64 bits are text, and keys are equal as YAML has them, by tag
+ *  and value, where Python's == also makes 1, 1.0 and true one key. The
+ *  syntax is YAML 1.2's,
  *  but a block scalar ending the input gets no final line feed, as in
  *  libyaml. Malformed YAML that libyaml lets through stays an error, such
  *  as a comment touching a closing quote or bracket or a block scalar's
@@ -746,12 +748,20 @@ OYL_API oyl_mark oyl_node_mark(const oyl_tree *t, uint32_t i);
 OYL_API uint32_t oyl_node_target(const oyl_tree *t, uint32_t i);
 
 /** The value of @p key in mapping @p map (or an alias to one), or
- *  OYL_NO_NODE. Keys are scalars matched by their text, plain or quoted;
- *  a key written twice gives its last value; << merges apply in the
- *  order of the document's dialect. A << whose value can't be merged (not
- *  a mapping, an alias to one, or a sequence of those, which YAML's merge
- *  also takes through an alias) is an ordinary key. */
+ *  OYL_NO_NODE. @p key is the string key; when the mapping has none, the
+ *  key a scalar written as @p key is, so "80" finds 80. Keys are equal
+ *  when their tags and values are, as YAML compares them: 0x50 and 80
+ *  are one key, 80 and "80" two. A key written twice gives its last
+ *  value; << merges apply in the order of the document's dialect. A <<
+ *  whose value can't be merged (not a mapping, an alias to one, or a
+ *  sequence of those, which YAML's merge also takes through an alias) is
+ *  an ordinary key. */
 OYL_API uint32_t oyl_node_get(const oyl_tree *t, uint32_t map, oyl_str key);
+
+/** As oyl_node_get(), for the key equal to @p key: a scalar of its kind's
+ *  tag (!!null, !!bool, !!int, !!float, or for text !!str) with its
+ *  value, so an OYL_VALUE_INT 80 finds 80 and 0x50 but not "80". */
+OYL_API uint32_t oyl_node_get_value(const oyl_tree *t, uint32_t map, const oyl_value *key);
 
 /** Item @p k of sequence @p seq (or an alias to one), or OYL_NO_NODE. */
 OYL_API uint32_t oyl_node_at(const oyl_tree *t, uint32_t seq, uint32_t k);
@@ -763,10 +773,12 @@ enum {
 
 /** A mapping's pairs as a program sees it, by the rules of oyl_node_get():
  *  merges applied and each key once, in the order keys first appear. The
- *  array is allocated in @p a. Keys are matched by text, so collection
- *  keys are all kept. Returns OYL_ERR_PARSE under OYL_ENTRIES_STRICT for a
- *  repeated key, with @p *n its node; OYL_ERR_LIMIT for merges nested too
- *  deep or too costly; OYL_ERR_INPUT if @p map isn't a mapping. */
+ *  array is allocated in @p a. Scalar keys are equal when their tags and
+ *  values are (YAML 1.2.2 §3.2.1.3), so 1 and "1" are two keys and 0x1
+ *  and 1 one; collection keys are all kept. Returns OYL_ERR_PARSE under
+ *  OYL_ENTRIES_STRICT for a repeated key, the error YAML makes it, with
+ *  @p *n the first key written again; OYL_ERR_LIMIT for merges nested
+ *  too deep or too costly; OYL_ERR_INPUT if @p map isn't a mapping. */
 OYL_API oyl_status oyl_node_entries(const oyl_tree *t, uint32_t map, unsigned flags,
                                     oyl_arena *a, const oyl_pair **pairs, size_t *n);
 

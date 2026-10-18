@@ -411,6 +411,7 @@ extern "C" {
     pub fn oyl_node_mark(t: *const oyl_tree, i: u32) -> oyl_mark;
     pub fn oyl_node_target(t: *const oyl_tree, i: u32) -> u32;
     pub fn oyl_node_get(t: *const oyl_tree, map: u32, key: oyl_str) -> u32;
+    pub fn oyl_node_get_value(t: *const oyl_tree, map: u32, key: *const oyl_value) -> u32;
     pub fn oyl_node_at(t: *const oyl_tree, seq: u32, k: u32) -> u32;
     pub fn oyl_node_entries(t: *const oyl_tree, map: u32, flags: c_uint, a: *mut oyl_arena, pairs: *mut *const oyl_pair, n: *mut usize) -> oyl_status;
 

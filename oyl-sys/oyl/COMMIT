@@ -1,1 +1,1 @@
-5c121362ff33ceca27d3b3b0495ba97483285ef6 2026-10-18 Merges as PyYAML does them; YAML 1.1 is PyYAML's types and merge
+4191b09cb34b8f7f3a2286224f5c60e4cefce138 2026-10-18 Keys compared by tag and value, as YAML says: 1 and "1" two, 0x1 and 1 one

@@ -242,11 +242,24 @@ impl<'t> Node<'t> {
         (up != 0).then(|| Node { tree: self.tree, i: self.i - up })
     }
 
-    /// The value of `key` in a mapping, or `None`. Keys are scalars matched
-    /// by their text, plain or quoted; a key written twice gives its last
-    /// value; `<<` merges apply in the document's dialect's order.
+    /// The value of `key` in a mapping, or `None`. `key` is the string
+    /// key; when the mapping has none, the key a scalar written as `key`
+    /// is, so `"80"` finds `80`. Keys are equal when their tags and values
+    /// are, as YAML compares them: `0x50` and `80` are one key, `80` and
+    /// `"80"` two. A key written twice gives its last value; `<<` merges
+    /// apply in the document's dialect's order.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Option<Node<'t>> {
         let i = unsafe { sys::oyl_node_get(self.tree.raw(), self.i, raw_str(Some(key.as_ref()))) };
+        (i != sys::OYL_NO_NODE).then_some(Node { tree: self.tree, i })
+    }
+
+    /// As [`get`](Node::get), for the key equal to `key`: a scalar of its
+    /// kind's tag (`!!null`, `!!bool`, `!!int`, `!!float`, or for text
+    /// `!!str`) with its value, so `Value::Int(80)` finds `80` and `0x50`
+    /// but not `"80"`.
+    pub fn get_value(&self, key: Value<'_>) -> Option<Node<'t>> {
+        let raw = key.raw();
+        let i = unsafe { sys::oyl_node_get_value(self.tree.raw(), self.i, &raw) };
         (i != sys::OYL_NO_NODE).then_some(Node { tree: self.tree, i })
     }
 
@@ -290,14 +303,16 @@ impl<'t> Node<'t> {
     }
 
     /// A mapping as a program sees it: `<<` merges applied, each key once
-    /// (its last value), in the order keys first appear. Collection keys
-    /// are all kept.
+    /// (its last value), in the order keys first appear. Scalar keys are
+    /// equal when their tags and values are, so `1` and `"1"` are two keys
+    /// and `0x1` and `1` one; collection keys are all kept.
     pub fn entries(&self) -> Result<Vec<(Node<'t>, Node<'t>)>, Error> {
         self.collect_entries(0)
     }
 
     /// As [`entries`](Node::entries), but a key written twice is an error,
-    /// with the repeated key's position.
+    /// as YAML has it, with the repeated key's position: `true` and `True`
+    /// are a repeat, `1` and `"1"` aren't.
     pub fn entries_strict(&self) -> Result<Vec<(Node<'t>, Node<'t>)>, Error> {
         self.collect_entries(sys::OYL_ENTRIES_STRICT)
     }

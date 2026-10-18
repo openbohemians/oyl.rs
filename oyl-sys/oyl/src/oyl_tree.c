@@ -508,25 +508,48 @@ static uint32_t merge_items(const oyl_tree *t, uint32_t v, uint32_t *first) {
     return seq ? t->nodes[v].len : 1;
 }
 
-static bool key_is(const oyl_tree *t, uint32_t k, oyl_str key) {
-    const oyl_node *n = &t->nodes[oyl_node_target(t, k)];
-    return n->kind == OYL_NODE_SCALAR && n->len == key.len &&
-           (key.len == 0 || memcmp(oyl_tree_text(t, n).data, key.data, key.len) == 0);
+/* Key k as keys are compared (k a scalar, not an alias) */
+static void key_of(const oyl_tree *t, uint32_t k, oyl_key *key) {
+    const oyl_node *n = &t->nodes[k];
+    if (!n->props && (n->style != OYL_SCALAR_PLAIN || n->type == 0)) {   /* a string, as most keys are */
+        *key = (oyl_key){ n->style != OYL_SCALAR_PLAIN ? t->schema->default_quoted_tag
+                                                      : t->schema->default_plain_tag,
+                          { .kind = OYL_VALUE_STR, .as = { .s = oyl_tree_text(t, n) } } };
+        return;
+    }
+    oyl_value v;
+    oyl_status st = oyl_node_value(t, k, &v);
+    oyl_key_make(key, oyl_key_tag(t->schema, oyl_node_tag(t, k)), oyl_node_text(t, k), st, &v);
 }
 
+/* A lookup: by key, or by text */
 typedef struct {
     const oyl_tree *t;
-    oyl_str         key;
-    struct { uint32_t map, value; } memo[64];   /* sources already searched */
+    const oyl_key  *key;    /* the key equal to this, or */
+    oyl_str         text;   /* any scalar key with this text */
+    struct { uint32_t map, key; } memo[64];   /* sources already searched */
     int             nmemo;
     size_t          budget;
 } getter;
+
+static bool matches(const getter *g, uint32_t k) {
+    const oyl_tree *t = g->t;
+    k = oyl_node_target(t, k);
+    const oyl_node *n = &t->nodes[k];
+    if (n->kind != OYL_NODE_SCALAR) return false;
+    if (!g->key)
+        return n->len == g->text.len &&
+               (g->text.len == 0 || memcmp(oyl_tree_text(t, n).data, g->text.data, g->text.len) == 0);
+    oyl_key key;
+    key_of(t, k, &key);
+    return oyl_key_cmp(&key, g->key) == 0;
+}
 
 static uint32_t get_in(getter *g, uint32_t m, int depth) {
     const oyl_tree *t = g->t;
     const oyl_node *n = t->nodes;
     for (int j = 0; j < g->nmemo; j++)
-        if (g->memo[j].map == m) return g->memo[j].value;
+        if (g->memo[j].map == m) return g->memo[j].key;
     if (depth > MAX_MERGE_DEPTH) return NONE;
     bool merging = t->merge != OYL_MERGE_NONE, ordered = t->merge == OYL_MERGE_ORDERED;
     bool merges = false;
@@ -544,8 +567,8 @@ static uint32_t get_in(getter *g, uint32_t m, int depth) {
                     if (r != NONE) { found = r; break; }
                 }
             }
-        } else if (key_is(t, k, g->key)) {
-            found = v;
+        } else if (matches(g, k)) {
+            found = k;
         }
         k = next;
     }
@@ -567,16 +590,50 @@ static uint32_t get_in(getter *g, uint32_t m, int depth) {
     }
     if (depth > 0 && g->nmemo < (int)(sizeof g->memo / sizeof g->memo[0])) {
         g->memo[g->nmemo].map = m;
-        g->memo[g->nmemo++].value = found;
+        g->memo[g->nmemo++].key = found;
     }
     return found;
+}
+
+/* The key in mapping `map` that counts for `key`, or NONE */
+static uint32_t get_key(const oyl_tree *t, uint32_t map, const oyl_key *key, oyl_str text) {
+    getter g = { .t = t, .key = key, .text = text, .budget = (size_t)t->len * 16 + 100000 };
+    return get_in(&g, map, 0);
+}
+
+static uint32_t value_of(const oyl_tree *t, uint32_t k) {
+    return k == NONE ? NONE : k + t->nodes[k].span;
 }
 
 uint32_t oyl_node_get(const oyl_tree *t, uint32_t map, oyl_str key) {
     map = oyl_node_target(t, map);
     if (map == NONE || t->nodes[map].kind != OYL_NODE_MAPPING) return NONE;
-    getter g = { .t = t, .key = key, .budget = (size_t)t->len * 16 + 100000 };
-    return get_in(&g, map, 0);
+    /* the string, else the key a scalar written as `key` is (80 for "80") */
+    oyl_key str = { t->schema->default_quoted_tag, { .kind = OYL_VALUE_STR, .as = { .s = key } } };
+    uint32_t k = get_key(t, map, &str, key);
+    if (k != NONE) return value_of(t, k);
+    if ((k = get_key(t, map, NULL, key)) == NONE) return NONE;
+    k = oyl_node_target(t, k);
+    oyl_key written;
+    key_of(t, k, &written);
+    return value_of(t, get_key(t, map, &written, key));
+}
+
+uint32_t oyl_node_get_value(const oyl_tree *t, uint32_t map, const oyl_value *key) {
+    map = oyl_node_target(t, map);
+    if (!key || map == NONE || t->nodes[map].kind != OYL_NODE_MAPPING) return NONE;
+    oyl_str tag;
+    switch (key->kind) {
+    case OYL_VALUE_NULL:  tag = OYL_TAG_NULL; break;
+    case OYL_VALUE_BOOL:  tag = OYL_TAG_BOOL; break;
+    case OYL_VALUE_INT:
+    case OYL_VALUE_UINT:  tag = OYL_TAG_INT; break;
+    case OYL_VALUE_FLOAT: tag = OYL_TAG_FLOAT; break;
+    default:              tag = t->schema->default_quoted_tag; break;
+    }
+    oyl_key want;
+    oyl_key_make(&want, tag, OYL_STR_NULL, OYL_OK, key);
+    return value_of(t, get_key(t, map, &want, OYL_STR_NULL));
 }
 
 /* ── A mapping's entries ─────────────────────────────────── */
@@ -587,84 +644,107 @@ typedef struct {
     uint32_t key, value;
     uint64_t prio;
     uint32_t pos;
+    uint32_t form;      /* a scalar key's in the collector's forms; else NONE, by node */
     bool     written;   /* written in the mapping asked about */
 } ent;
 
 typedef struct {
     const oyl_tree *t;
     unsigned        flags;
-    ent            *e, *tmp;
+    ent            *e, *tmp, *e_buf;
     uint32_t        len, cap, tmp_cap;
+    oyl_key        *forms, *forms_buf;   /* the scalar keys as compared, apart: entries move */
+    uint32_t        nforms, forms_cap;
     size_t          budget;
     oyl_status      status;
     uint32_t        bad;   /* the repeated key, under OYL_ENTRIES_STRICT */
 } collector;
 
+/* Room for one more in an array that starts in a buffer on the stack
+ * (most mappings are small), and moves to the heap when it's full */
+static bool room(void **data, const void *buf, uint32_t *cap, uint32_t len, size_t size) {
+    if (len < *cap) return true;
+    if (*data != buf) return grow_slow(data, cap, len, 1, size);
+    void *p = malloc((size_t)*cap * 2 * size);
+    if (!p) return false;
+    memcpy(p, buf, (size_t)len * size);
+    *data = p;
+    *cap *= 2;
+    return true;
+}
+
 static bool push_ent(collector *c, ent e) {
     if (c->budget == 0) { c->status = OYL_ERR_LIMIT; return false; }
     c->budget--;
-    if (!grow((void **)&c->e, &c->cap, c->len, 1, sizeof *c->e)) { c->status = OYL_ERR_MEMORY; return false; }
+    if (!room((void **)&c->e, c->e_buf, &c->cap, c->len, sizeof *c->e)) { c->status = OYL_ERR_MEMORY; return false; }
+    uint32_t k = oyl_node_target(c->t, e.key);
+    e.form = NONE;
+    if (c->t->nodes[k].kind == OYL_NODE_SCALAR) {
+        if (!room((void **)&c->forms, c->forms_buf, &c->forms_cap, c->nforms, sizeof *c->forms)) {
+            c->status = OYL_ERR_MEMORY;
+            return false;
+        }
+        key_of(c->t, k, &c->forms[c->nforms]);
+        e.form = c->nforms++;
+    }
     c->e[c->len++] = e;
     return true;
 }
 
-/* Order by key (scalars by text, collections by node), then priority */
-static int by_key(const oyl_tree *t, const ent *a, const ent *b) {
-    uint32_t ka = oyl_node_target(t, a->key), kb = oyl_node_target(t, b->key);
-    bool sa = t->nodes[ka].kind == OYL_NODE_SCALAR, sb = t->nodes[kb].kind == OYL_NODE_SCALAR;
+/* Order by key (scalars by tag and value, collections by node), then
+ * priority */
+static int by_key(const collector *c, const ent *a, const ent *b) {
+    bool sa = a->form != NONE, sb = b->form != NONE;
     if (sa != sb) return sa ? -1 : 1;
     if (sa) {
-        oyl_str x = oyl_tree_text(t, &t->nodes[ka]), y = oyl_tree_text(t, &t->nodes[kb]);
-        size_t n = x.len < y.len ? x.len : y.len;
-        int r = n ? memcmp(x.data, y.data, n) : 0;
+        int r = oyl_key_cmp(&c->forms[a->form], &c->forms[b->form]);
         if (r) return r;
-        if (x.len != y.len) return x.len < y.len ? -1 : 1;
-    } else if (ka != kb) {
-        return ka < kb ? -1 : 1;
+    } else {
+        uint32_t ka = oyl_node_target(c->t, a->key), kb = oyl_node_target(c->t, b->key);
+        if (ka != kb) return ka < kb ? -1 : 1;
     }
     return a->prio < b->prio ? -1 : a->prio > b->prio;
 }
 
-static int by_pos(const oyl_tree *t, const ent *a, const ent *b) {
-    (void)t;
+static int by_pos(const collector *c, const ent *a, const ent *b) {
+    (void)c;
     return a->pos < b->pos ? -1 : a->pos > b->pos;
 }
 
-typedef int (*ent_cmp)(const oyl_tree *, const ent *, const ent *);
+typedef int (*ent_cmp)(const collector *, const ent *, const ent *);
 
-static void sort_ents(const oyl_tree *t, ent *e, ent *tmp, uint32_t n, ent_cmp cmp) {
+static void sort_ents(const collector *c, ent *e, ent *tmp, uint32_t n, ent_cmp cmp) {
     if (n < 2) return;
     if (n <= 16) {   /* insertion sort */
         for (uint32_t i = 1; i < n; i++) {
             ent x = e[i];
             uint32_t j = i;
-            while (j > 0 && cmp(t, &e[j - 1], &x) > 0) { e[j] = e[j - 1]; j--; }
+            while (j > 0 && cmp(c, &e[j - 1], &x) > 0) { e[j] = e[j - 1]; j--; }
             e[j] = x;
         }
         return;
     }
     uint32_t h = n / 2;
-    sort_ents(t, e, tmp, h, cmp);
-    sort_ents(t, e + h, tmp, n - h, cmp);
+    sort_ents(c, e, tmp, h, cmp);
+    sort_ents(c, e + h, tmp, n - h, cmp);
     uint32_t i = 0, j = h, k = 0;
-    while (i < h && j < n) tmp[k++] = cmp(t, &e[j], &e[i]) < 0 ? e[j++] : e[i++];
+    while (i < h && j < n) tmp[k++] = cmp(c, &e[j], &e[i]) < 0 ? e[j++] : e[i++];
     while (i < h) tmp[k++] = e[i++];
     while (j < n) tmp[k++] = e[j++];
     memcpy(e, tmp, n * sizeof *e);
 }
 
-static bool same_key(const oyl_tree *t, const ent *a, const ent *b) {
+static bool same_key(const collector *c, const ent *a, const ent *b) {
     ent x = *a, y = *b;
     x.prio = y.prio = 0;
-    return by_key(t, &x, &y) == 0;
+    return by_key(c, &x, &y) == 0;
 }
 
 /* Settle the entries from `base`: one per key, the highest priority at the
  * first position, in order of position */
 static bool settle(collector *c, uint32_t base, bool top) {
-    const oyl_tree *t = c->t;
     uint32_t n = c->len - base;
-    if (n == 0) return true;   /* c->e may still be NULL */
+    if (n == 0) return true;
     if (n > 16 && n > c->tmp_cap) {
         ent *tmp = realloc(c->tmp, n * sizeof *tmp);
         if (!tmp) { c->status = OYL_ERR_MEMORY; return false; }
@@ -672,27 +752,33 @@ static bool settle(collector *c, uint32_t base, bool top) {
         c->tmp_cap = n;
     }
     ent *e = c->e + base;
-    sort_ents(t, e, c->tmp, n, by_key);
-    uint32_t out = 0;
+    sort_ents(c, e, c->tmp, n, by_key);
+    uint32_t out = 0, repeat = NONE;   /* the first key written again */
     for (uint32_t i = 0; i < n;) {
         uint32_t j = i + 1, pos = e[i].pos, written = e[i].written;
-        while (j < n && same_key(t, &e[j], &e[i])) {
+        while (j < n && same_key(c, &e[j], &e[i])) {
             if (e[j].pos < pos) pos = e[j].pos;
             written += e[j++].written;
         }
         if (top && written > 1 && (c->flags & OYL_ENTRIES_STRICT)) {
-            uint32_t last = 0;
-            for (uint32_t w = i; w < j; w++)
-                if (e[w].written && e[w].key > last) last = e[w].key;
-            c->status = OYL_ERR_PARSE;
-            c->bad = last;
-            return false;
+            uint32_t first = NONE, second = NONE;
+            for (uint32_t w = i; w < j; w++) {
+                if (!e[w].written) continue;
+                if (e[w].key < first) { second = first; first = e[w].key; }
+                else if (e[w].key < second) second = e[w].key;
+            }
+            if (second < repeat) repeat = second;
         }
         e[out] = e[j - 1];
         e[out++].pos = pos;
         i = j;
     }
-    sort_ents(t, e, c->tmp, out, by_pos);
+    if (repeat != NONE) {
+        c->status = OYL_ERR_PARSE;
+        c->bad = repeat;
+        return false;
+    }
+    sort_ents(c, e, c->tmp, out, by_pos);
     c->len = base + out;
     return true;
 }
@@ -729,7 +815,7 @@ static bool collect(collector *c, uint32_t m, int depth, bool top) {
             else merged += count;
         } else {
             uint64_t prio = ordered || !merging ? ++counter : written_prio + ++counter;
-            if (!push_ent(c, (ent){ k, v, prio, pos++, top })) return false;
+            if (!push_ent(c, (ent){ .key = k, .value = v, .prio = prio, .pos = pos++, .written = top })) return false;
         }
         k = next;
     }
@@ -744,7 +830,11 @@ oyl_status oyl_node_entries(const oyl_tree *t, uint32_t map, unsigned flags, oyl
     if (!t || !a) return OYL_ERR_INPUT;
     map = oyl_node_target(t, map);
     if (map == NONE || t->nodes[map].kind != OYL_NODE_MAPPING) return OYL_ERR_INPUT;
-    collector c = { .t = t, .flags = flags, .budget = (size_t)t->len * 16 + 100000 };
+    ent e_buf[32];
+    oyl_key forms_buf[32];
+    collector c = { .t = t, .flags = flags, .e = e_buf, .e_buf = e_buf, .cap = 32,
+                    .forms = forms_buf, .forms_buf = forms_buf, .forms_cap = 32,
+                    .budget = (size_t)t->len * 16 + 100000 };
     oyl_status st = OYL_OK;
     if (!collect(&c, map, 0, true)) {
         st = c.status;
@@ -759,7 +849,8 @@ oyl_status oyl_node_entries(const oyl_tree *t, uint32_t map, unsigned flags, oyl
             *n = c.len;
         }
     }
-    free(c.e);
+    if (c.e != e_buf) free(c.e);
+    if (c.forms != forms_buf) free(c.forms);
     free(c.tmp);
     return st;
 }

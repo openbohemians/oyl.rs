@@ -85,8 +85,10 @@ and `span` (the input it was read from, for edits that keep formatting),
 `get` and `at`, `items` and `pairs` as written, and `entries` as a program
 sees the mapping. Aliases and `<<` merge keys stay as written in the tree;
 `get` and `entries` follow aliases and apply merges in the order of the
-document's dialect. `entries_strict` makes a repeated key an error with its
-position.
+document's dialect. Keys are equal as YAML compares them, by tag and value:
+`0x50` and `80` are one key, `80` and `"80"` two. `get` takes a key's text
+(`"80"` finds the string, else `80`), `get_value` its value.
+`entries_strict` makes a repeated key an error with its position.
 
 Text stays in the input, except what the parser rewrote (escapes, folded
 lines), which the tree keeps: a tree borrows the input, not the parser, so

@@ -304,6 +304,19 @@ impl<'a> Value<'a> {
         }
     }
 
+    /// As the C library has it; text points into the value's bytes.
+    pub(crate) fn raw(&self) -> sys::oyl_value {
+        let (kind, as_) = match *self {
+            Value::Null => (sys::OYL_VALUE_NULL, sys::oyl_value_as { i: 0 }),
+            Value::Bool(b) => (sys::OYL_VALUE_BOOL, sys::oyl_value_as { b }),
+            Value::Int(i) => (sys::OYL_VALUE_INT, sys::oyl_value_as { i }),
+            Value::Uint(u) => (sys::OYL_VALUE_UINT, sys::oyl_value_as { u }),
+            Value::Float(f) => (sys::OYL_VALUE_FLOAT, sys::oyl_value_as { f }),
+            Value::Str(s) => (sys::OYL_VALUE_STR, sys::oyl_value_as { s: raw_str(Some(s)) }),
+        };
+        sys::oyl_value { kind, as_ }
+    }
+
     /// Whether it's [`Value::Null`].
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
@@ -584,14 +597,15 @@ impl Dialect<'static> {
 
     /// YAML 1.1 with PyYAML's types ([`Schema::yaml11`]) and YAML's
     /// merge: a document PyYAML reads gets the same values. Two
-    /// exceptions: ints beyond 64 bits are text, and a tree matches keys
-    /// by their text, so `yes` and `true` are two keys and `1` and `"1"`
-    /// are one. The syntax is YAML 1.2's, but a block scalar ending the
-    /// input gets no final line feed, as in libyaml. Malformed YAML that
-    /// libyaml lets through stays an error, such as a comment touching a
-    /// closing quote or bracket or a block scalar's header (`"a"#c`,
-    /// `[a]#c`, `|#c`), or a quoted scalar or flow collection whose later
-    /// lines aren't indented past the block it sits in.
+    /// exceptions: ints beyond 64 bits are text, and keys are equal as
+    /// YAML has them, by tag and value, where Python's `==` also makes
+    /// `1`, `1.0` and `true` one key. The syntax is YAML 1.2's, but a
+    /// block scalar ending the input gets no final line feed, as in
+    /// libyaml. Malformed YAML that libyaml lets through stays an error,
+    /// such as a comment touching a closing quote or bracket or a block
+    /// scalar's header (`"a"#c`, `[a]#c`, `|#c`), or a quoted scalar or
+    /// flow collection whose later lines aren't indented past the block it
+    /// sits in.
     pub fn yaml11() -> Self {
         Dialect::preset(unsafe { sys::oyl_dialect_yaml11() })
     }

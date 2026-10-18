@@ -2367,9 +2367,10 @@ static void ebuf_push_range(evt_buf *b, const oyl_event *events, int start, int 
         ebuf_push(b, events[i]);
 }
 
-/* Key set for tracking seen keys (override semantics) */
+/* Key set for tracking seen keys (override semantics), compared as YAML
+ * compares keys: by tag and value, in the document's schema */
 typedef struct {
-    oyl_str *keys;
+    oyl_key *keys;
     int      len;
     int      cap;
 } key_set;
@@ -2383,25 +2384,30 @@ static void kset_free(key_set *ks) {
     ks->keys = NULL; ks->len = 0; ks->cap = 0;
 }
 
-static bool kset_contains(const key_set *ks, oyl_str key) {
-    for (int i = 0; i < ks->len; i++) {
-        /* empty keys may have NULL data: don't pass it to memcmp */
-        if (ks->keys[i].len == key.len &&
-            (key.len == 0 || memcmp(ks->keys[i].data, key.data, key.len) == 0))
-            return true;
-    }
+/* The scalar event `evt` as a key */
+static void event_key(const oyl_parser *p, const oyl_event *evt, oyl_key *k) {
+    const oyl_schema *s = p->res_schema ? p->res_schema : oyl_dialect_schema(p->doc_dialect);
+    oyl_str tag = evt->tag.len ? evt->tag : oyl_schema_resolve(s, evt->value, evt->scalar_style);
+    oyl_value v;
+    oyl_status st = oyl_schema_value_of(s, evt->value, evt->scalar_style, evt->tag, &v);
+    oyl_key_make(k, oyl_key_tag(s, tag), evt->value, st, &v);
+}
+
+static bool kset_contains(const key_set *ks, const oyl_key *key) {
+    for (int i = 0; i < ks->len; i++)
+        if (oyl_key_cmp(&ks->keys[i], key) == 0) return true;
     return false;
 }
 
-static void kset_add(key_set *ks, oyl_str key) {
+static void kset_add(key_set *ks, const oyl_key *key) {
     if (kset_contains(ks, key)) return;
     if (ks->len >= ks->cap) {
         int nc = ks->cap ? ks->cap * 2 : 16;
-        oyl_str *nk = realloc(ks->keys, nc * sizeof(oyl_str));
+        oyl_key *nk = realloc(ks->keys, nc * sizeof(oyl_key));
         if (!nk) return;
         ks->keys = nk; ks->cap = nc;
     }
-    ks->keys[ks->len++] = key;
+    ks->keys[ks->len++] = *key;
 }
 
 /* Is evt a merge key? << untagged and plain, or tagged !!merge. A schema
@@ -2511,9 +2517,11 @@ static const char *merge_from(merger *m, int s, int e, int depth) {
             int ve = node_end(m->events, m->evt_len, ke);
             if (!is_merge(m, pos, s, e)) {
                 bool scalar_key = ke - pos == 1 && m->events[pos].type == OYL_EVT_SCALAR;
+                oyl_key key;
+                if (scalar_key) event_key(m->p, &m->events[pos], &key);
                 if (step == 1) {
-                    if (scalar_key) kset_add(m->seen, m->events[pos].value);
-                } else if (!scalar_key || !kset_contains(m->seen, m->events[pos].value)) {
+                    if (scalar_key) kset_add(m->seen, &key);
+                } else if (!scalar_key || !kset_contains(m->seen, &key)) {
                     /* copies carry no anchors (not new definitions) */
                     for (int j = pos; j < ve && !m->out->oom; j++) {
                         oyl_event copy = m->events[j];
@@ -2644,8 +2652,11 @@ static oyl_status resolve_merges(oyl_parser *p) {
                     if (!is_merge(&mg, pos, map_start, map_end)) {
                         if (step == 1)
                             ebuf_push_range(&out, p->events, pos, ve);
-                        else if (ke - pos == 1 && p->events[pos].type == OYL_EVT_SCALAR)
-                            kset_add(&seen, p->events[pos].value);
+                        else if (ke - pos == 1 && p->events[pos].type == OYL_EVT_SCALAR) {
+                            oyl_key key;
+                            event_key(p, &p->events[pos], &key);
+                            kset_add(&seen, &key);
+                        }
                     }
                     pos = ve;
                 }

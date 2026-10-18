@@ -11,6 +11,7 @@
 #define OYL_INTERNAL_H
 
 #include "oyl/oyl.h"
+#include <string.h>
 
 /* ── Schema ──────────────────────────────────────────────── */
 
@@ -77,6 +78,65 @@ typedef struct {
 int oyl_schema_rule_of(const oyl_schema *schema, oyl_str text);
 /* Rule `rule`'s value of `text`: 1 accepted, 0 declined, -1 out of memory */
 int oyl_schema_rule_value(const oyl_schema *schema, int rule, oyl_str text, oyl_value *out);
+
+/* A scalar as mapping keys are compared: two are equal when their tags
+ * and values are (YAML 1.2.2 §3.2.1.3), so 0x1 and 1 are one key, 1 and
+ * "1" two. Inline: trees sort keys with these. */
+typedef struct {
+    oyl_str   tag;
+    oyl_value value;
+} oyl_key;
+
+/* A key's tag from the scalar's (written, else resolved): ! makes it a
+ * string */
+static inline oyl_str oyl_key_tag(const oyl_schema *schema, oyl_str tag) {
+    return tag.len == 1 && tag.data[0] == '!' ? schema->default_quoted_tag : tag;
+}
+
+/* The key for a scalar with tag `tag` (from oyl_key_tag) and `text`, given
+ * the status and value oyl_schema_value_of gave it: one its tag rejects is
+ * its text */
+static inline void oyl_key_make(oyl_key *k, oyl_str tag, oyl_str text, oyl_status st,
+                                const oyl_value *v) {
+    k->tag = tag;
+    if (st == OYL_OK) k->value = *v;
+    else k->value = (oyl_value){ .kind = OYL_VALUE_STR, .as = { .s = text } };
+    /* one int, whichever kind a parser gave it */
+    if (k->value.kind == OYL_VALUE_UINT && k->value.as.u <= INT64_MAX)
+        k->value = (oyl_value){ .kind = OYL_VALUE_INT, .as = { .i = (int64_t)k->value.as.u } };
+}
+
+static inline int oyl_bytes_cmp(oyl_str a, oyl_str b) {
+    size_t n = a.len < b.len ? a.len : b.len;
+    int r = n ? memcmp(a.data, b.data, n) : 0;
+    return r ? r : (a.len > b.len) - (a.len < b.len);
+}
+
+/* Are two keys' tags the same? */
+static inline bool oyl_key_tag_eq(oyl_str a, oyl_str b) {
+    return (a.data == b.data && a.len == b.len) ||
+           (a.len == b.len && (a.len == 0 || memcmp(a.data, b.data, a.len) == 0));
+}
+
+/* Order keys, 0 when equal: by tag, then value, NaN equal to NaN */
+static inline int oyl_key_cmp(const oyl_key *a, const oyl_key *b) {
+    if (!oyl_key_tag_eq(a->tag, b->tag)) return oyl_bytes_cmp(a->tag, b->tag);
+    const oyl_value *x = &a->value, *y = &b->value;
+    if (x->kind != y->kind) return x->kind < y->kind ? -1 : 1;
+    switch (x->kind) {
+    case OYL_VALUE_NULL:  return 0;
+    case OYL_VALUE_BOOL:  return (x->as.b > y->as.b) - (x->as.b < y->as.b);
+    case OYL_VALUE_INT:   return (x->as.i > y->as.i) - (x->as.i < y->as.i);
+    case OYL_VALUE_UINT:  return (x->as.u > y->as.u) - (x->as.u < y->as.u);
+    case OYL_VALUE_FLOAT: {
+        /* .nan's canonical form is one, so NaN equals NaN, after the numbers */
+        bool nx = x->as.f != x->as.f, ny = y->as.f != y->as.f;
+        if (nx || ny) return nx - ny;
+        return (x->as.f > y->as.f) - (x->as.f < y->as.f);
+    }
+    default:              return oyl_bytes_cmp(x->as.s, y->as.s);   /* text */
+    }
+}
 
 /* Report a warning from parsing, once (see oyl_warn_state) */
 void oyl_warn(oyl_warn_state *w, oyl_warning code, oyl_mark mark, const char *msg);
