@@ -101,8 +101,11 @@ impl fmt::Debug for Tree<'_> {
 /// What a [`Node`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeKind {
+    /// A scalar: [`Node::text`] and [`Node::value`].
     Scalar,
+    /// A sequence: [`Node::items`].
     Sequence,
+    /// A mapping: [`Node::pairs`], [`Node::get`], [`Node::entries`].
     Mapping,
     /// An alias (`*name`): [`Node::target`] is the node it refers to.
     Alias,
@@ -136,6 +139,7 @@ impl<'t> Node<'t> {
         self.tree.raw_node(self.i)
     }
 
+    /// What the node is.
     pub fn kind(&self) -> NodeKind {
         match self.raw().kind as sys::oyl_node_kind {
             sys::OYL_NODE_SEQUENCE => NodeKind::Sequence,

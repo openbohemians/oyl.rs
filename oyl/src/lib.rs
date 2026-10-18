@@ -60,6 +60,10 @@
 //! The C library is compiled from sources vendored in the `oyl-sys` crate,
 //! so nothing needs to be installed.
 
+#![warn(missing_docs)]
+// docs.rs (nightly, --cfg docsrs) labels what a feature enables
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, CStr};
 use std::fmt;
@@ -73,8 +77,10 @@ mod tree;
 pub use tree::{Items, Node, NodeKind, Pairs, Tree, Trees};
 
 #[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 pub mod de;
 #[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 pub use de::{from_node, from_reader, from_slice, from_slice_with, from_str, from_str_with};
 
 // ── Positions, kinds and styles ─────────────────────────────
@@ -83,8 +89,11 @@ pub use de::{from_node, from_reader, from_slice, from_slice_with, from_str, from
 /// (the column counts bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Mark {
+    /// Bytes from the start of the input.
     pub offset: usize,
+    /// The line, from 1.
     pub line: usize,
+    /// The column, from 1, in bytes.
     pub column: usize,
 }
 
@@ -99,15 +108,25 @@ impl From<sys::oyl_mark> for Mark {
 /// is a scalar, an alias, or a mapping or sequence holding nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventKind {
+    /// The start of the input.
     StreamStart,
+    /// The end of the input; the last event.
     StreamEnd,
+    /// A document begins, with `---` or without ([`Event::implicit`]).
     DocumentStart,
+    /// A document ends, with `...` or without.
     DocumentEnd,
+    /// A mapping begins; its keys and values follow, alternating.
     MappingStart,
+    /// The mapping ends.
     MappingEnd,
+    /// A sequence begins; its items follow.
     SequenceStart,
+    /// The sequence ends.
     SequenceEnd,
+    /// A scalar: its text is [`Event::value`].
     Scalar,
+    /// An alias (`*name`): the name is [`Event::value`].
     Alias,
 }
 
@@ -132,9 +151,12 @@ impl EventKind {
 /// How a scalar was written, or should be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ScalarStyle {
+    /// Unquoted: `text`.
     #[default]
     Plain,
+    /// In single quotes: `'text'`.
     SingleQuoted,
+    /// In double quotes, with escapes: `"text\n"`.
     DoubleQuoted,
     /// A block literal, `|`.
     Literal,
@@ -170,6 +192,7 @@ impl ScalarStyle {
 /// input), so the event can be kept while parsing goes on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Event<'p> {
+    /// What the event is.
     pub kind: EventKind,
     /// A scalar's value or an alias's name; empty for other events.
     pub value: &'p [u8],
@@ -184,7 +207,9 @@ pub struct Event<'p> {
     pub implicit: bool,
     /// For mappings and sequences: flow style (`{...}`, `[...]`).
     pub flow: bool,
+    /// Where its text starts in the input.
     pub start: Mark,
+    /// Where its text ends.
     pub end: Mark,
 }
 
@@ -235,11 +260,15 @@ fn raw_str(s: Option<&[u8]>) -> sys::oyl_str {
 #[derive(Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum Value<'a> {
+    /// `null`, `~`, or nothing.
     Null,
+    /// `true` or `false` (and, in YAML 1.1 and go-yaml v2, `yes`, `on`...).
     Bool(bool),
+    /// An integer that fits `i64`.
     Int(i64),
     /// An integer above `i64::MAX`.
     Uint(u64),
+    /// A floating-point number, `.inf` and `.nan` included.
     Float(f64),
     /// Text: a string, a timestamp, or an integer beyond 64 bits.
     Str(&'a [u8]),
@@ -275,10 +304,12 @@ impl<'a> Value<'a> {
         }
     }
 
+    /// Whether it's [`Value::Null`].
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
 
+    /// A boolean.
     pub fn as_bool(&self) -> Option<bool> {
         match *self {
             Value::Bool(b) => Some(b),
@@ -377,10 +408,12 @@ pub struct Error {
 }
 
 impl Error {
+    /// What kind of failure it is.
     pub fn kind(&self) -> ErrorKind {
         self.kind
     }
 
+    /// Oyl's description of it, without the position.
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -567,6 +600,7 @@ impl Dialect<'_> {
         Schema::preset(unsafe { sys::oyl_dialect_schema(self.0.as_ptr()) })
     }
 
+    /// How it applies `<<` merge keys.
     pub fn merge_order(&self) -> MergeOrder {
         match unsafe { sys::oyl_dialect_merge(self.0.as_ptr()) } {
             sys::OYL_MERGE_NONE => MergeOrder::None,
@@ -864,6 +898,7 @@ impl Emitter {
         }
     }
 
+    /// Write in this style (default [`EmitStyle::Block`]).
     pub fn style(&mut self, style: EmitStyle) -> &mut Self {
         let raw = match style {
             EmitStyle::Block => sys::OYL_EMIT_BLOCK,
@@ -880,10 +915,12 @@ impl Emitter {
         self
     }
 
+    /// Begin the output; call it first.
     pub fn stream_start(&mut self) -> Result<(), Error> {
         check(unsafe { sys::oyl_emit_stream_start(self.e()) })
     }
 
+    /// End the output; call it last.
     pub fn stream_end(&mut self) -> Result<(), Error> {
         check(unsafe { sys::oyl_emit_stream_end(self.e()) })
     }
@@ -915,6 +952,7 @@ impl Emitter {
         self.raw_mapping_start(anchor.map(str::as_bytes), tag.map(str::as_bytes), flow)
     }
 
+    /// End the mapping begun last.
     pub fn mapping_end(&mut self) -> Result<(), Error> {
         check(unsafe { sys::oyl_emit_mapping_end(self.e()) })
     }
@@ -924,6 +962,7 @@ impl Emitter {
         self.raw_sequence_start(anchor.map(str::as_bytes), tag.map(str::as_bytes), flow)
     }
 
+    /// End the sequence begun last.
     pub fn sequence_end(&mut self) -> Result<(), Error> {
         check(unsafe { sys::oyl_emit_sequence_end(self.e()) })
     }
