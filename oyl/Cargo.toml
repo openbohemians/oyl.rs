@@ -13,3 +13,14 @@ readme = "../README.md"
 
 [dependencies]
 oyl-sys = { version = "0.2.0", path = "../oyl-sys" }
+serde = { version = "1", optional = true }
+
+[features]
+# oyl::from_str and friends: serde deserialization from a document's tree
+serde = ["dep:serde"]
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[package.metadata.docs.rs]
+all-features = true

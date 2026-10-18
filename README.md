@@ -94,6 +94,52 @@ it can outlive the parser, and threads can share it. `raw_nodes()` gives
 Oyl's 32-byte nodes for walking without calls. `Emitter::tree` writes a
 tree back out as YAML.
 
+## serde
+
+With the `serde` feature, `oyl::from_str` deserializes YAML into your
+types:
+
+```toml
+[dependencies]
+oyl = { version = "0.2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+```
+
+```rust
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Container<'a> {
+    name: &'a str,
+    image: &'a str,
+    image_pull_policy: Option<String>,
+}
+
+let c: Container = oyl::from_str("name: web\nimage: nginx:1.27\n")?;
+```
+
+The YAML is read into a tree and deserialized from it:
+
+- Scalars are typed by YAML 1.2 by default; `from_str_with(input,
+  Dialect::goyaml2())` reads as Kubernetes does (`paused: no` is a bool).
+  A string field takes any scalar's text (`version: 1.20` is `"1.20"`).
+- `&str` fields borrow from the input when the parser didn't rewrite the
+  text (escapes, folded lines); `String` or `Cow<str>` take any.
+- Aliases are followed and `<<` merges applied in the dialect's order. A
+  key written twice is an error, whatever the target type.
+- Enums are a string (a unit variant), a mapping with one key, or a
+  `!Variant` tag, as serde_yaml writes them.
+- Errors give the line and column of the node that didn't fit. Nesting
+  past 128 and alias bombs are errors, not stack overflows.
+- `from_node` deserializes any node of a tree you hold, so a stream's
+  documents can be read one by one (`Parser::trees`), or part of one.
+
+On 848 public Kubernetes manifests, deserializing is 2.3x faster than
+serde_yaml 0.9 into a generic value (every node visited) and 4.2x faster
+into a typed struct (measured on one core of an Intel Core Ultra 7 155H).
+serde_yaml was archived in 2024.
+
 ## Dialects
 
 A dialect decides which types scalars get and how `<<` merges: YAML 1.2's

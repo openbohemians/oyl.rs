@@ -54,6 +54,9 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! With the `serde` feature, `oyl::from_str` and friends
+//! deserialize YAML into your types, from its tree (see the `de` module).
+//!
 //! The C library is compiled from sources vendored in the `oyl-sys` crate,
 //! so nothing needs to be installed.
 
@@ -68,6 +71,11 @@ use oyl_sys as sys;
 
 mod tree;
 pub use tree::{Items, Node, NodeKind, Pairs, Tree, Trees};
+
+#[cfg(feature = "serde")]
+pub mod de;
+#[cfg(feature = "serde")]
+pub use de::{from_node, from_reader, from_slice, from_slice_with, from_str, from_str_with};
 
 // ── Positions, kinds and styles ─────────────────────────────
 
@@ -339,6 +347,8 @@ pub enum ErrorKind {
     /// A safety limit was exceeded: the event count, nesting depth, or
     /// alias and merge expansion. See [`Parser::max_events`].
     Limit,
+    /// The YAML doesn't fit the type it's deserialized into (serde).
+    Data,
     /// A status this version doesn't know.
     Other,
 }
@@ -468,6 +478,20 @@ impl Schema {
     pub fn resolve(&self, value: &[u8], style: ScalarStyle) -> &'static [u8] {
         // SAFETY: a preset's tags are static strings
         unsafe { bytes(sys::oyl_schema_resolve(self.0.as_ptr(), raw_str(Some(value)), style.raw())) }
+    }
+
+    /// The value this schema gives a scalar written as `text` in `style`,
+    /// with `tag` (`None`: untagged, so resolved first). An error if the
+    /// tag's rules reject the text (`!!int abc`); a tag with no rules gives
+    /// the text.
+    pub fn value<'a>(&self, text: &'a [u8], style: ScalarStyle, tag: Option<&[u8]>) -> Result<Value<'a>, Error> {
+        let mut v = std::mem::MaybeUninit::<sys::oyl_value>::uninit();
+        let status = unsafe {
+            sys::oyl_schema_value_of(self.0.as_ptr(), raw_str(Some(text)), style.raw(), raw_str(tag), v.as_mut_ptr())
+        };
+        check(status)?;
+        // SAFETY: on success the value is set; text points into `text`
+        Ok(unsafe { Value::from_raw(&v.assume_init(), text) })
     }
 }
 

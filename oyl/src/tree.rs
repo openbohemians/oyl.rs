@@ -300,10 +300,18 @@ impl<'t> Node<'t> {
 
     fn collect_entries(&self, flags: std::ffi::c_uint) -> Result<Vec<(Node<'t>, Node<'t>)>, Error> {
         let arena = NonNull::new(unsafe { sys::oyl_arena_new(4096) }).ok_or_else(Error::memory)?;
+        let out = self.entries_in(arena, flags);
+        unsafe { sys::oyl_arena_free(arena.as_ptr()) };
+        out
+    }
+
+    /// The entries, with the C pairs allocated in `arena` (which the caller
+    /// may reset afterwards: the pairs are copied out).
+    pub(crate) fn entries_in(&self, arena: NonNull<sys::oyl_arena>, flags: std::ffi::c_uint) -> Result<Vec<(Node<'t>, Node<'t>)>, Error> {
         let mut pairs: *const sys::oyl_pair = std::ptr::null();
         let mut n: usize = 0;
         let status = unsafe { sys::oyl_node_entries(self.tree.raw(), self.i, flags, arena.as_ptr(), &mut pairs, &mut n) };
-        let out = match status {
+        match status {
             sys::OYL_OK => {
                 // SAFETY: on success `pairs` holds `n` pairs, in the arena
                 let raw = if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(pairs, n) } };
@@ -322,9 +330,7 @@ impl<'t> Node<'t> {
             sys::OYL_ERR_INPUT => Err(self.error(ErrorKind::Input, "not a mapping")),
             sys::OYL_ERR_LIMIT => Err(self.error(ErrorKind::Limit, "merges nested too deep or too costly")),
             _ => Err(Error::from_status(status)),
-        };
-        unsafe { sys::oyl_arena_free(arena.as_ptr()) };
-        out
+        }
     }
 
     fn error(&self, kind: ErrorKind, message: &str) -> Error {
