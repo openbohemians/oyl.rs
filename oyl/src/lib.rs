@@ -490,8 +490,10 @@ impl Schema {
         Schema::preset(unsafe { sys::oyl_schema_core() })
     }
 
-    /// YAML 1.1's types: `y`/`n`/`yes`/`no`/`on`/`off` booleans, `0b`
-    /// binary, `0`-octal, base 60, underscores, timestamps, `<<` as a merge.
+    /// YAML 1.1's types as PyYAML reads them: `yes`/`no`/`on`/`off`
+    /// booleans (not `y`/`n`), `0b` binary, `0`-octal, base 60,
+    /// underscores, floats with a dot (`.5`, not `-.5`), timestamps, `<<`
+    /// as a merge.
     pub fn yaml11() -> Self {
         Schema::preset(unsafe { sys::oyl_schema_yaml11() })
     }
@@ -550,7 +552,8 @@ pub enum MergeOrder {
 
 /// What varies between YAML worlds: a schema (which types scalars get),
 /// syntax leniencies, and how `<<` merges. A document reads by the
-/// parser's dialect, unless its `%YAML 1.1` directive chooses YAML 1.1's.
+/// parser's dialect, unless it starts with `%YAML 1.1`, which chooses
+/// [`Dialect::yaml11`]: YAML 1.1 as libyaml and PyYAML read it.
 ///
 /// The presets are `Dialect<'static>`; a [`Tree`]'s dialect borrows from
 /// the tree (the parser may have made it from a [`Schema`] alone, and the
@@ -577,13 +580,16 @@ impl Dialect<'static> {
         Dialect::preset(unsafe { sys::oyl_dialect_yaml12() })
     }
 
-    /// YAML 1.1: its types ([`Schema::yaml11`]), read with YAML 1.2's
-    /// syntax, and YAML's merge.
+    /// YAML 1.1 as libyaml and PyYAML read it: PyYAML's types
+    /// ([`Schema::yaml11`]), YAML 1.2's syntax but for a block scalar
+    /// ending the input, which gets no final line feed (as libyaml), and
+    /// YAML's merge. libyaml's acceptance of some invalid YAML (tabs as
+    /// indentation) isn't taken on.
     pub fn yaml11() -> Self {
         Dialect::preset(unsafe { sys::oyl_dialect_yaml11() })
     }
 
-    /// go-yaml v2, as Kubernetes reads YAML: its types, libyaml's syntax
+    /// go-yaml v2, as Kubernetes reads YAML: its types, its syntax
     /// leniencies, and its merge order.
     pub fn goyaml2() -> Self {
         Dialect::preset(unsafe { sys::oyl_dialect_goyaml2() })
@@ -734,8 +740,8 @@ impl<'i> Parser<'i> {
         self
     }
 
-    /// Read documents by this dialect, unless one's `%YAML 1.1` directive
-    /// chooses YAML 1.1's. Trees and JSON type scalars by it.
+    /// Read documents by this dialect, unless one starts with `%YAML 1.1`,
+    /// which chooses [`Dialect::yaml11`]. Trees and JSON type scalars by it.
     pub fn dialect(&mut self, dialect: Dialect<'static>) -> &mut Self {
         unsafe { sys::oyl_parser_set_dialect(self.parser.as_ptr(), dialect.0.as_ptr()) };
         self

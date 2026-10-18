@@ -373,12 +373,14 @@ enum {
     OYL_FLOAT_DIGIT_UNDERSCORE = 1 << 6,  /**< underscores after the first digit and in the
                                                fraction, not the exponent (YAML 1.1) */
     OYL_FLOAT_BASE60     = 1 << 7,  /**< 1:20.5 is 80.5 (YAML 1.1) */
+    OYL_FLOAT_DOT_NO_SIGN = 1 << 8, /**< no sign before a leading dot: .5 but not -.5
+                                         (PyYAML) */
     /** The Core schema's floats. Digits alone count for an explicit
      *  !!float; untagged, the int rule takes them first. */
     OYL_FLOAT_CORE = OYL_FLOAT_SPECIALS | OYL_FLOAT_DIGITS,
-    /** YAML 1.1's floats (yaml.org/type/float, as PyYAML reads its pattern) */
+    /** YAML 1.1's floats, as PyYAML reads them (yaml.org/type/float) */
     OYL_FLOAT_YAML11 = OYL_FLOAT_SPECIALS | OYL_FLOAT_NEED_DOT | OYL_FLOAT_EXP_SIGN |
-                       OYL_FLOAT_DIGIT_UNDERSCORE | OYL_FLOAT_BASE60,
+                       OYL_FLOAT_DIGIT_UNDERSCORE | OYL_FLOAT_BASE60 | OYL_FLOAT_DOT_NO_SIGN,
 };
 
 /** Add the built-in int parser with the given OYL_INT_ options. */
@@ -407,10 +409,10 @@ OYL_API oyl_status oyl_schema_value(const oyl_schema *schema, const oyl_event *s
 OYL_API oyl_status oyl_schema_value_of(const oyl_schema *schema, oyl_str text,
                                        oyl_scalar_style style, oyl_str tag, oyl_value *out);
 
-/** YAML 1.1's types (yaml.org/type): y/n/yes/no/on/off booleans, 0b
- *  binary, 0-octal, base 60, underscores, floats with a dot, timestamps,
- *  << as !!merge and = as !!value. Where the 1.1 patterns contradict
- *  themselves, as libyaml's PyYAML reads them. */
+/** YAML 1.1's types as PyYAML reads them, PyYAML being the usual loader
+ *  on libyaml: yes/no/on/off booleans (not y/n, which yaml.org/type also
+ *  lists), 0b binary, 0-octal, base 60, underscores, floats with a dot
+ *  (.5, but not -.5), timestamps, << as !!merge and = as !!value. */
 OYL_API const oyl_schema *oyl_schema_yaml11(void);
 
 /** go-yaml v2's types, as Kubernetes reads YAML: yes/no/on/off and y/n
@@ -512,12 +514,13 @@ typedef struct oyl_dialect oyl_dialect;
 /** Syntax leniencies a dialect may take on: each is an error, or reads
  *  differently, in YAML 1.2. */
 enum {
-    OYL_SYNTAX_SQUOTE_ESCAPE = 1 << 0,  /**< \' in double quotes is ' */
+    OYL_SYNTAX_SQUOTE_ESCAPE = 1 << 0,  /**< \' in double quotes is ' (go-yaml v2) */
     OYL_SYNTAX_EOF_NO_BREAK  = 1 << 1,  /**< a block scalar ending the input gets no
-                                             final line feed */
-    OYL_SYNTAX_YAML11_ONLY   = 1 << 2,  /**< %YAML other than 1.1 is an error */
-    /** libyaml's, as go-yaml v2 inherits them */
-    OYL_SYNTAX_LIBYAML = OYL_SYNTAX_SQUOTE_ESCAPE | OYL_SYNTAX_EOF_NO_BREAK | OYL_SYNTAX_YAML11_ONLY,
+                                             final line feed (libyaml, so PyYAML and
+                                             go-yaml v2) */
+    OYL_SYNTAX_YAML11_ONLY   = 1 << 2,  /**< %YAML other than 1.1 is an error (go-yaml v2) */
+    /** go-yaml v2's */
+    OYL_SYNTAX_GOYAML2 = OYL_SYNTAX_SQUOTE_ESCAPE | OYL_SYNTAX_EOF_NO_BREAK | OYL_SYNTAX_YAML11_ONLY,
 };
 
 /** How << merge keys combine with the keys written in a mapping. */
@@ -536,11 +539,14 @@ OYL_API oyl_merge_order   oyl_dialect_merge(const oyl_dialect *d);
 
 /** YAML 1.2: the Core schema, YAML 1.2's syntax, YAML's merge. */
 OYL_API const oyl_dialect *oyl_dialect_yaml12(void);
-/** YAML 1.1: its types (oyl_schema_yaml11), read with YAML 1.2's syntax, as
- *  the spec asks of a 1.2 parser, and YAML's merge. */
+/** YAML 1.1 as libyaml and PyYAML read it: PyYAML's types
+ *  (oyl_schema_yaml11), YAML 1.2's syntax but for a block scalar ending
+ *  the input, which gets no final line feed, and YAML's merge. libyaml's
+ *  acceptance of some invalid YAML (tabs as indentation, # right after
+ *  text) isn't taken on. */
 OYL_API const oyl_dialect *oyl_dialect_yaml11(void);
-/** go-yaml v2, as Kubernetes reads YAML: its types, libyaml's syntax
- *  leniencies, and its merge order. */
+/** go-yaml v2, as Kubernetes reads YAML: its types, its syntax
+ *  leniencies (OYL_SYNTAX_GOYAML2), and its merge order. */
 OYL_API const oyl_dialect *oyl_dialect_goyaml2(void);
 
 /** The default dialect, for documents whose directives choose none. Without

@@ -213,9 +213,10 @@ pub const OYL_FLOAT_NEED_DOT: c_uint = 1 << 4;
 pub const OYL_FLOAT_EXP_SIGN: c_uint = 1 << 5;
 pub const OYL_FLOAT_DIGIT_UNDERSCORE: c_uint = 1 << 6;
 pub const OYL_FLOAT_BASE60: c_uint = 1 << 7;
+pub const OYL_FLOAT_DOT_NO_SIGN: c_uint = 1 << 8;
 pub const OYL_FLOAT_CORE: c_uint = OYL_FLOAT_SPECIALS | OYL_FLOAT_DIGITS;
 pub const OYL_FLOAT_YAML11: c_uint = OYL_FLOAT_SPECIALS | OYL_FLOAT_NEED_DOT | OYL_FLOAT_EXP_SIGN
-    | OYL_FLOAT_DIGIT_UNDERSCORE | OYL_FLOAT_BASE60;
+    | OYL_FLOAT_DIGIT_UNDERSCORE | OYL_FLOAT_BASE60 | OYL_FLOAT_DOT_NO_SIGN;
 
 // ── Dialects and warnings ───────────────────────────────────
 
@@ -223,7 +224,8 @@ pub const OYL_FLOAT_YAML11: c_uint = OYL_FLOAT_SPECIALS | OYL_FLOAT_NEED_DOT | O
 pub const OYL_SYNTAX_SQUOTE_ESCAPE: c_uint = 1 << 0;
 pub const OYL_SYNTAX_EOF_NO_BREAK: c_uint = 1 << 1;
 pub const OYL_SYNTAX_YAML11_ONLY: c_uint = 1 << 2;
-pub const OYL_SYNTAX_LIBYAML: c_uint = OYL_SYNTAX_SQUOTE_ESCAPE | OYL_SYNTAX_EOF_NO_BREAK | OYL_SYNTAX_YAML11_ONLY;
+/// go-yaml v2's leniencies.
+pub const OYL_SYNTAX_GOYAML2: c_uint = OYL_SYNTAX_SQUOTE_ESCAPE | OYL_SYNTAX_EOF_NO_BREAK | OYL_SYNTAX_YAML11_ONLY;
 
 /// How `<<` merge keys combine with the keys written in a mapping.
 pub type oyl_merge_order = c_uint;

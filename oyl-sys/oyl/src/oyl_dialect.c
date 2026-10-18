@@ -8,8 +8,9 @@
 #include "oyl_internal.h"
 
 static const oyl_dialect yaml12 = { .schema = NULL, .syntax = 0, .merge = OYL_MERGE_YAML };
-static const oyl_dialect yaml11 = { .schema = NULL, .syntax = 0, .merge = OYL_MERGE_YAML };
-static const oyl_dialect goyaml2 = { .schema = NULL, .syntax = OYL_SYNTAX_LIBYAML,
+static const oyl_dialect yaml11 = { .schema = NULL, .syntax = OYL_SYNTAX_EOF_NO_BREAK,
+                                    .merge = OYL_MERGE_YAML };
+static const oyl_dialect goyaml2 = { .schema = NULL, .syntax = OYL_SYNTAX_GOYAML2,
                                      .merge = OYL_MERGE_ORDERED };
 
 /* The presets' schemas are functions' results, not constants, so the

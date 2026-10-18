@@ -321,7 +321,11 @@ static int parse_float(const char *s, size_t len, unsigned flags, oyl_value *out
     }
     cursor c = { s, len, 0, underscores };
     int ch = cur_peek(&c);
-    if (ch == '+' || ch == '-') { cur_next(&c); ch = cur_peek(&c); }
+    if (ch == '+' || ch == '-') {
+        cur_next(&c);
+        ch = cur_peek(&c);
+        if (ch == '.' && (flags & OYL_FLOAT_DOT_NO_SIGN)) return 0;
+    }
     bool digits = false, dot = false, exp = false;
     for (; ch >= '0' && ch <= '9'; cur_next(&c), ch = cur_peek(&c)) digits = true;
     if (ch == '.') {
@@ -722,16 +726,18 @@ const oyl_schema *oyl_schema_core(void) {
     return &core_schema;
 }
 
-/* YAML 1.1's types (yaml.org/type), with PyYAML's reading where the
- * patterns contradict themselves: a float needs a digit (the float pattern
- * would take "." and "1.2.3"), and a zone may follow a space (as the
- * timestamp type's own example has it) */
+/* YAML 1.1's types as PyYAML reads them, PyYAML being libyaml's usual
+ * loader: unlike yaml.org/type, y and n are text, and so is a signed
+ * leading-dot float (-.5); where the spec's patterns contradict
+ * themselves, a float needs a digit (the float pattern would take "." and
+ * "1.2.3"), and a zone may follow a space (as the timestamp type's own
+ * example has it) */
 static const oyl_schema_rule yaml11_rules[] = {
     NULL_WORD("~"), NULL_WORD("null"), NULL_WORD("Null"), NULL_WORD("NULL"), NULL_WORD(""),
-    TRUE_WORD("y"), TRUE_WORD("Y"), TRUE_WORD("yes"), TRUE_WORD("Yes"), TRUE_WORD("YES"),
+    TRUE_WORD("yes"), TRUE_WORD("Yes"), TRUE_WORD("YES"),
     TRUE_WORD("true"), TRUE_WORD("True"), TRUE_WORD("TRUE"),
     TRUE_WORD("on"), TRUE_WORD("On"), TRUE_WORD("ON"),
-    FALSE_WORD("n"), FALSE_WORD("N"), FALSE_WORD("no"), FALSE_WORD("No"), FALSE_WORD("NO"),
+    FALSE_WORD("no"), FALSE_WORD("No"), FALSE_WORD("NO"),
     FALSE_WORD("false"), FALSE_WORD("False"), FALSE_WORD("FALSE"),
     FALSE_WORD("off"), FALSE_WORD("Off"), FALSE_WORD("OFF"),
     WORD("<<", TAG(MERGE), V_TEXT),
