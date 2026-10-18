@@ -7,7 +7,9 @@ scanning and zero-copy strings.
 Two crates:
 
 - **`oyl`**: the safe API. A pull parser whose events come from an iterator,
-  errors that say where they happened, schema presets, and an emitter.
+  documents as trees with lookups and typed values, dialects (YAML 1.2,
+  YAML 1.1, go-yaml v2 as Kubernetes reads YAML), YAML to JSON, errors that
+  say where they happened, and an emitter.
 - **`oyl-sys`**: the raw C declarations, mirroring `oyl.h`. It compiles Oyl
   from sources vendored in the crate, so nothing needs to be installed; a C
   compiler is enough.
@@ -16,7 +18,7 @@ Two crates:
 
 ```toml
 [dependencies]
-oyl = "0.1"
+oyl = "0.2"
 ```
 
 ## Parsing
@@ -59,6 +61,69 @@ for parse errors, the position. For `"a: 1\nb: [2, 3\n"`:
 expected ',' or ']' in flow sequence at line 3, column 1
 ```
 
+## Trees
+
+A tree holds a document in memory: look things up, walk it, and read
+typed values, without handling events.
+
+```rust
+use oyl::{Parser, Value};
+
+let parser = Parser::new("base: &b {replicas: 2}\nweb:\n  <<: *b\n  image: nginx\n")?;
+let tree = parser.next_tree()?.expect("a document");
+let web = tree.root().get("web").expect("a key");
+assert_eq!(web.get("image").unwrap().text(), b"nginx");
+assert_eq!(web.get("replicas").unwrap().value()?, Value::Int(2));
+for (key, value) in web.entries()? {          // merges applied, each key once
+    println!("{} = {:?}", key.text_str()?, value.value()?);
+}
+```
+
+`next_tree` reads one document (`trees()` iterates over them). A `Node` is
+a cheap handle: its kind, text, tag, anchor, style, typed `value`, `mark`
+and `span` (the input it was read from, for edits that keep formatting),
+`get` and `at`, `items` and `pairs` as written, and `entries` as a program
+sees the mapping. Aliases and `<<` merge keys stay as written in the tree;
+`get` and `entries` follow aliases and apply merges in the order of the
+document's dialect. `entries_strict` makes a repeated key an error with its
+position.
+
+Text stays in the input, except what the parser rewrote (escapes, folded
+lines), which the tree keeps: a tree borrows the input, not the parser, so
+it can outlive the parser, and threads can share it. `raw_nodes()` gives
+Oyl's 32-byte nodes for walking without calls. `Emitter::tree` writes a
+tree back out as YAML.
+
+## Dialects
+
+A dialect decides which types scalars get and how `<<` merges: YAML 1.2's
+core schema by default, YAML 1.1's (`yes` and `on` are booleans, `0777` is
+octal), or go-yaml v2's, as Kubernetes reads YAML. A document's
+`%YAML 1.1` directive chooses YAML 1.1's.
+
+```rust
+use oyl::{Dialect, Parser, Value};
+
+let mut parser = Parser::new("enabled: yes\nmode: 0644\n")?;
+parser.dialect(Dialect::goyaml2());
+let tree = parser.next_tree()?.unwrap();
+assert_eq!(tree.root().get("enabled").unwrap().value()?, Value::Bool(true));
+assert_eq!(tree.root().get("mode").unwrap().value()?, Value::Int(0o644));
+```
+
+## YAML to JSON
+
+`next_json` writes the next document as JSON. With
+`JsonOptions::kubernetes()` the output is byte for byte what
+sigs.k8s.io/yaml's `YAMLToJSON` writes:
+
+```rust
+use oyl::{JsonOptions, Parser};
+
+let parser = Parser::new("b: yes\na: 0777\n")?;
+assert_eq!(parser.next_json(&JsonOptions::kubernetes())?, Some(r#"{"a":511,"b":true}"#));
+```
+
 ## Emitting
 
 ```rust
@@ -90,12 +155,12 @@ Oyl:
 
 ```sh
 scripts/sync-oyl.sh path/to/oyl          # the checkout's committed HEAD
-scripts/sync-oyl.sh path/to/oyl v1.1.0   # or a release tag
+scripts/sync-oyl.sh path/to/oyl v1.2.0   # or a release tag
 cargo test
 ```
 
 The script also sets the build metadata of `oyl-sys`'s version, the part
-after `+`, to the vendored Oyl version: `0.1.0+1.0.0` bundles Oyl 1.0.0.
+after `+`, to the vendored Oyl version: `0.2.0+1.2.0` bundles Oyl 1.2.0.
 crates.io won't take two versions that differ only there, so publishing
 newly vendored sources also needs a bump before the `+`.
 

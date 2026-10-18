@@ -39,6 +39,21 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! A [`Tree`] holds a document in memory, for lookups and typed values
+//! without handling events: `get` follows aliases and applies `<<` merges,
+//! and each scalar's value is typed by the document's [`Dialect`]:
+//!
+//! ```
+//! use oyl::{Parser, Value};
+//!
+//! let parser = Parser::new("base: &b {replicas: 2}\nweb:\n  <<: *b\n  image: nginx\n")?;
+//! let tree = parser.next_tree()?.expect("a document");
+//! let web = tree.root().get("web").expect("a key");
+//! assert_eq!(web.get("image").unwrap().text(), b"nginx");
+//! assert_eq!(web.get("replicas").unwrap().value()?, Value::Int(2));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
 //! The C library is compiled from sources vendored in the `oyl-sys` crate,
 //! so nothing needs to be installed.
 
@@ -50,6 +65,9 @@ use std::ptr::NonNull;
 use std::str::Utf8Error;
 
 use oyl_sys as sys;
+
+mod tree;
+pub use tree::{Items, Node, NodeKind, Pairs, Tree, Trees};
 
 // ── Positions, kinds and styles ─────────────────────────────
 
@@ -203,6 +221,105 @@ fn raw_str(s: Option<&[u8]>) -> sys::oyl_str {
     }
 }
 
+// ── Values ──────────────────────────────────────────────────
+
+/// A scalar's value, as a schema types it.
+#[derive(Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum Value<'a> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    /// An integer above `i64::MAX`.
+    Uint(u64),
+    Float(f64),
+    /// Text: a string, a timestamp, or an integer beyond 64 bits.
+    Str(&'a [u8]),
+}
+
+impl fmt::Debug for Value<'_> {
+    /// Text shows as text (lossily, if it isn't UTF-8), not as bytes.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Value::Null => f.write_str("Null"),
+            Value::Bool(b) => f.debug_tuple("Bool").field(&b).finish(),
+            Value::Int(i) => f.debug_tuple("Int").field(&i).finish(),
+            Value::Uint(u) => f.debug_tuple("Uint").field(&u).finish(),
+            Value::Float(x) => f.debug_tuple("Float").field(&x).finish(),
+            Value::Str(s) => f.debug_tuple("Str").field(&String::from_utf8_lossy(s)).finish(),
+        }
+    }
+}
+
+impl<'a> Value<'a> {
+    /// # Safety
+    /// A string value must point to bytes that outlive `'a`; `text` is the
+    /// scalar's text, the value of a kind this version doesn't know.
+    unsafe fn from_raw(v: &sys::oyl_value, text: &'a [u8]) -> Self {
+        match v.kind {
+            sys::OYL_VALUE_NULL => Value::Null,
+            sys::OYL_VALUE_BOOL => Value::Bool(v.as_.b),
+            sys::OYL_VALUE_INT => Value::Int(v.as_.i),
+            sys::OYL_VALUE_UINT => Value::Uint(v.as_.u),
+            sys::OYL_VALUE_FLOAT => Value::Float(v.as_.f),
+            sys::OYL_VALUE_STR => Value::Str(bytes(v.as_.s)),
+            _ => Value::Str(text),
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match *self {
+            Value::Bool(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// An integer that fits `i64`.
+    pub fn as_i64(&self) -> Option<i64> {
+        match *self {
+            Value::Int(i) => Some(i),
+            Value::Uint(u) => i64::try_from(u).ok(),
+            _ => None,
+        }
+    }
+
+    /// An integer that fits `u64`.
+    pub fn as_u64(&self) -> Option<u64> {
+        match *self {
+            Value::Int(i) => u64::try_from(i).ok(),
+            Value::Uint(u) => Some(u),
+            _ => None,
+        }
+    }
+
+    /// A number as `f64`: a float, or an integer (rounded if it must be).
+    pub fn as_f64(&self) -> Option<f64> {
+        match *self {
+            Value::Float(f) => Some(f),
+            Value::Int(i) => Some(i as f64),
+            Value::Uint(u) => Some(u as f64),
+            _ => None,
+        }
+    }
+
+    /// Text as bytes.
+    pub fn as_bytes(&self) -> Option<&'a [u8]> {
+        match *self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Text as UTF-8.
+    pub fn as_str(&self) -> Option<Result<&'a str, Utf8Error>> {
+        self.as_bytes().map(std::str::from_utf8)
+    }
+}
+
 // ── Errors ──────────────────────────────────────────────────
 
 /// What kind of failure an [`Error`] is.
@@ -330,6 +447,18 @@ impl Schema {
         Schema::preset(unsafe { sys::oyl_schema_core() })
     }
 
+    /// YAML 1.1's types: `y`/`n`/`yes`/`no`/`on`/`off` booleans, `0b`
+    /// binary, `0`-octal, base 60, underscores, timestamps, `<<` as a merge.
+    pub fn yaml11() -> Self {
+        Schema::preset(unsafe { sys::oyl_schema_yaml11() })
+    }
+
+    /// go-yaml v2's types, as Kubernetes reads YAML: `yes`/`no`/`on`/`off`
+    /// booleans, `0777` octal, `0b` binary, underscores, timestamps.
+    pub fn goyaml2() -> Self {
+        Schema::preset(unsafe { sys::oyl_schema_goyaml2() })
+    }
+
     fn preset(p: *const sys::oyl_schema) -> Self {
         Schema(NonNull::new(p.cast_mut()).expect("Oyl's preset schemas are static"))
     }
@@ -345,6 +474,128 @@ impl Schema {
 impl fmt::Debug for Schema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Schema")
+    }
+}
+
+// ── Dialects ────────────────────────────────────────────────
+
+/// How `<<` merge keys combine with the keys written in a mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum MergeOrder {
+    /// `<<` is an ordinary key.
+    None,
+    /// Keys written in the mapping win (YAML's merge).
+    Yaml,
+    /// go-yaml v2's: a merge overrides the keys written before it.
+    Ordered,
+}
+
+/// What varies between YAML worlds: a schema (which types scalars get),
+/// syntax leniencies, and how `<<` merges. A document reads by the
+/// parser's dialect, unless its `%YAML 1.1` directive chooses YAML 1.1's.
+///
+/// The presets are `Dialect<'static>`; a [`Tree`]'s dialect borrows from
+/// the tree (the parser may have made it from a [`Schema`] alone, and the
+/// tree keeps a copy), so it can't outlive the tree:
+///
+/// ```compile_fail
+/// let parser = oyl::Parser::new("a: 1").unwrap();
+/// let tree = parser.next_tree().unwrap().unwrap();
+/// let dialect = tree.dialect();
+/// drop(tree);
+/// dialect.merge_order();
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Dialect<'a>(NonNull<sys::oyl_dialect>, PhantomData<&'a sys::oyl_dialect>);
+
+// SAFETY: a dialect is never changed
+unsafe impl Send for Dialect<'_> {}
+unsafe impl Sync for Dialect<'_> {}
+
+impl Dialect<'static> {
+    /// YAML 1.2: the core schema, YAML 1.2's syntax, YAML's merge. The
+    /// default.
+    pub fn yaml12() -> Self {
+        Dialect::preset(unsafe { sys::oyl_dialect_yaml12() })
+    }
+
+    /// YAML 1.1: its types ([`Schema::yaml11`]), read with YAML 1.2's
+    /// syntax, and YAML's merge.
+    pub fn yaml11() -> Self {
+        Dialect::preset(unsafe { sys::oyl_dialect_yaml11() })
+    }
+
+    /// go-yaml v2, as Kubernetes reads YAML: its types, libyaml's syntax
+    /// leniencies, and its merge order.
+    pub fn goyaml2() -> Self {
+        Dialect::preset(unsafe { sys::oyl_dialect_goyaml2() })
+    }
+
+    fn preset(p: *const sys::oyl_dialect) -> Self {
+        Dialect(NonNull::new(p.cast_mut()).expect("Oyl's preset dialects are static"), PhantomData)
+    }
+}
+
+impl Dialect<'_> {
+    /// The schema that types its scalars.
+    pub fn schema(&self) -> Schema {
+        Schema::preset(unsafe { sys::oyl_dialect_schema(self.0.as_ptr()) })
+    }
+
+    pub fn merge_order(&self) -> MergeOrder {
+        match unsafe { sys::oyl_dialect_merge(self.0.as_ptr()) } {
+            sys::OYL_MERGE_NONE => MergeOrder::None,
+            sys::OYL_MERGE_ORDERED => MergeOrder::Ordered,
+            _ => MergeOrder::Yaml,
+        }
+    }
+}
+
+impl fmt::Debug for Dialect<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = if *self == Dialect::yaml12() {
+            "yaml12"
+        } else if *self == Dialect::yaml11() {
+            "yaml11"
+        } else if *self == Dialect::goyaml2() {
+            "goyaml2"
+        } else {
+            "custom"
+        };
+        write!(f, "Dialect({name})")
+    }
+}
+
+// ── JSON ────────────────────────────────────────────────────
+
+/// How [`Parser::next_json`] writes a document as JSON.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JsonOptions {
+    /// The schema that types scalars; `None` types them by the document's
+    /// dialect, whose merge order then applies.
+    pub schema: Option<Schema>,
+    /// Expand `<<` merge keys (with a schema; a dialect decides itself).
+    pub merge: bool,
+    /// With `merge`, go-yaml v2's order: a merge overrides the keys before it.
+    pub merge_ordered: bool,
+    /// A key set twice is an error, instead of keeping its last value.
+    pub strict: bool,
+}
+
+impl JsonOptions {
+    /// As Kubernetes reads YAML: byte for byte what sigs.k8s.io/yaml's
+    /// `YAMLToJSON` writes.
+    pub fn kubernetes() -> Self {
+        JsonOptions { schema: Some(Schema::goyaml2()), merge: true, merge_ordered: true, strict: false }
+    }
+
+    fn flags(&self) -> std::ffi::c_uint {
+        let mut f = 0;
+        if self.merge { f |= sys::OYL_JSON_MERGE; }
+        if self.merge_ordered { f |= sys::OYL_JSON_MERGE_ORDER; }
+        if self.strict { f |= sys::OYL_JSON_STRICT; }
+        f
     }
 }
 
@@ -423,6 +674,42 @@ impl<'i> Parser<'i> {
     pub fn schema(&mut self, schema: Schema) -> &mut Self {
         unsafe { sys::oyl_parser_set_schema(self.parser.as_ptr(), schema.0.as_ptr()) };
         self
+    }
+
+    /// Read documents by this dialect, unless one's `%YAML 1.1` directive
+    /// chooses YAML 1.1's. Trees and JSON type scalars by it.
+    pub fn dialect(&mut self, dialect: Dialect<'static>) -> &mut Self {
+        unsafe { sys::oyl_parser_set_dialect(self.parser.as_ptr(), dialect.0.as_ptr()) };
+        self
+    }
+
+    /// The next document as JSON; `Ok(None)` once the stream has ended.
+    /// Keys are sorted, a key set twice keeps its last value, aliases are
+    /// expanded, and numbers and strings are written as Go's encoding/json
+    /// writes them. Leave [`merge`](Parser::merge) and
+    /// [`resolve`](Parser::resolve) off: this does both.
+    pub fn next_json(&self, options: &JsonOptions) -> Result<Option<&str>, Error> {
+        if self.state.get() != State::Parsing {
+            return Ok(None);
+        }
+        let mut json = sys::oyl_str { data: std::ptr::null(), len: 0 };
+        let schema = options.schema.map_or(std::ptr::null(), |s| s.0.as_ptr().cast_const());
+        let status = unsafe { sys::oyl_parse_json(self.parser.as_ptr(), schema, options.flags(), &mut json) };
+        if status != sys::OYL_OK {
+            self.state.set(State::Failed);
+            return Err(self.error(status));
+        }
+        // SAFETY: the JSON is in the parser's arena, which outlives the borrow
+        let out = unsafe { bytes(json) };
+        if out.is_empty() {
+            self.state.set(State::Done);
+            return Ok(None);
+        }
+        std::str::from_utf8(out).map(Some).map_err(|_| Error {
+            kind: ErrorKind::Other,
+            message: "JSON output is not UTF-8".into(),
+            mark: None,
+        })
     }
 
     /// The next event; `Ok(None)` once the stream has ended.
@@ -631,6 +918,12 @@ impl Emitter {
             EventKind::Scalar => self.raw_scalar(event.value, event.style, event.anchor, event.tag),
             EventKind::Alias => self.raw_alias(event.value),
         }
+    }
+
+    /// Emit a tree as one document, with `---` and `...` where they were
+    /// written: what emitting its document's events would write.
+    pub fn tree(&mut self, tree: &Tree<'_>) -> Result<(), Error> {
+        check(unsafe { sys::oyl_emit_tree(self.e(), tree.raw()) })
     }
 
     /// The YAML written so far.
