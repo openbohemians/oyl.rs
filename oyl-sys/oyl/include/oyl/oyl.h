@@ -401,6 +401,12 @@ OYL_API void    oyl_schema_builder_add_type(oyl_schema_builder *b, oyl_str tag,
 OYL_API oyl_status oyl_schema_value(const oyl_schema *schema, const oyl_event *scalar,
                                     oyl_value *out);
 
+/** As oyl_schema_value(), for a scalar given by its parts: its @p text,
+ *  @p style and @p tag (empty for untagged). @c out->as.s points into
+ *  @p text. For bindings, which shouldn't make events of their own. */
+OYL_API oyl_status oyl_schema_value_of(const oyl_schema *schema, oyl_str text,
+                                       oyl_scalar_style style, oyl_str tag, oyl_value *out);
+
 /** YAML 1.1's types (yaml.org/type): y/n/yes/no/on/off booleans, 0b
  *  binary, 0-octal, base 60, underscores, floats with a dot, timestamps,
  *  << as !!merge and = as !!value. Where the 1.1 patterns contradict

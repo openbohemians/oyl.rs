@@ -614,6 +614,7 @@ oyl_status oyl_schema_value(const oyl_schema *schema, const oyl_event *scalar,
 
 oyl_status oyl_schema_value_of(const oyl_schema *schema, oyl_str text, oyl_scalar_style style,
                                oyl_str tag, oyl_value *out) {
+    if (!schema || !out || (!text.data && text.len) || (!tag.data && tag.len)) return OYL_ERR_INPUT;
     if (tag.len == 0) {
         if (style == OYL_SCALAR_PLAIN) {
             int i = match(schema, text, out);

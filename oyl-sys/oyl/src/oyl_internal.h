@@ -72,9 +72,6 @@ typedef struct {
     bool        seen[8];
 } oyl_warn_state;
 
-/* oyl_schema_value from a scalar's parts (for oyl_json.c) */
-oyl_status oyl_schema_value_of(const oyl_schema *schema, oyl_str text, oyl_scalar_style style,
-                               oyl_str tag, oyl_value *out);
 /* The rule that resolves untagged plain `text`, or -1 for the default (for
  * oyl_tree.c, which keeps it per node) */
 int oyl_schema_rule_of(const oyl_schema *schema, oyl_str text);

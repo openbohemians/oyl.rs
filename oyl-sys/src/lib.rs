@@ -365,6 +365,7 @@ extern "C" {
     pub fn oyl_schema_builder_add_float_flags(b: *mut oyl_schema_builder, flags: c_uint);
     pub fn oyl_schema_builder_add_type(b: *mut oyl_schema_builder, tag: oyl_str, parse: oyl_scalar_parser, user: *mut c_void);
     pub fn oyl_schema_value(schema: *const oyl_schema, scalar: *const oyl_event, out: *mut oyl_value) -> oyl_status;
+    pub fn oyl_schema_value_of(schema: *const oyl_schema, text: oyl_str, style: oyl_scalar_style, tag: oyl_str, out: *mut oyl_value) -> oyl_status;
     pub fn oyl_schema_yaml11() -> *const oyl_schema;
     pub fn oyl_schema_goyaml2() -> *const oyl_schema;
 
