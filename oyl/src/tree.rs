@@ -62,6 +62,31 @@ impl<'i> Tree<'i> {
         unsafe { std::slice::from_raw_parts(self.nodes, self.count as usize) }
     }
 
+    /// The tags and anchors as Oyl lays them out: node `n`'s are
+    /// `raw_props()[n.props as usize]`, entry 0 standing for none, except
+    /// for an alias, whose `props` is the node it refers to. Their text is
+    /// in [`raw_pool`](Tree::raw_pool) (length 0: none); a tag is as
+    /// written, its handle expanded.
+    pub fn raw_props(&self) -> &[sys::oyl_node_props] {
+        let mut count = 0u32;
+        let props = unsafe { sys::oyl_tree_props(self.raw(), &mut count) };
+        if props.is_null() || count == 0 {
+            return &[];
+        }
+        // SAFETY: the array has `count` entries, initialized, and lives as
+        // long as the tree
+        unsafe { std::slice::from_raw_parts(props, count as usize) }
+    }
+
+    /// The tree's own text: scalars the parser rewrote (escapes, folded
+    /// lines; a node flagged `OYL_NODE_POOLED`, whose `text` is an offset
+    /// here rather than in the input), tags, anchors and directives, at the
+    /// offsets the nodes and [`raw_props`](Tree::raw_props) give.
+    pub fn raw_pool(&self) -> &[u8] {
+        // SAFETY: the pool lives as long as the tree
+        unsafe { bytes(sys::oyl_tree_pool(self.raw())) }
+    }
+
     /// The document's dialect, which typed its scalars.
     pub fn dialect(&self) -> Dialect<'_> {
         let d = unsafe { sys::oyl_tree_dialect(self.raw()) };

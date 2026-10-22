@@ -75,11 +75,15 @@ use std::ptr::NonNull;
 use std::str::Utf8Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use oyl_sys as sys;
+/// The raw C declarations (the `oyl-sys` crate): the types and constants
+/// of [`Tree::raw_nodes`], [`Tree::raw_props`] and [`Tree::raw_pool`].
+pub use oyl_sys as sys;
 
 mod custom;
+mod scanner;
 mod tree;
 pub use custom::{CustomDialect, CustomSchema, FloatFlags, IntFlags, SchemaBuilder, Syntax};
+pub use scanner::{Scanner, Token, TokenKind, Tokens};
 pub use tree::{Items, Node, NodeKind, Pairs, Tree, Trees};
 
 #[cfg(feature = "serde")]

@@ -327,6 +327,34 @@ fn a_tree_keeps_its_directives() {
 }
 
 #[test]
+fn raw_arrays_hold_what_the_calls_give() {
+    let tree = tree_of("%TAG !e! tag:x:\n--- &r\na: !e!t \"q\\tr\"\nb: &k [1, *k]\n");
+    let (nodes, props, pool) = (tree.raw_nodes(), tree.raw_props(), tree.raw_pool());
+    assert_eq!(props[0], oyl::sys::oyl_node_props::default(), "entry 0 is none");
+    let text = |at: u32, len: u32| &pool[at as usize..(at + len) as usize];
+    let mut tags = 0;
+    for (i, n) in nodes.iter().enumerate() {
+        let node = tree.node(i).unwrap();
+        if node.kind() == NodeKind::Alias {
+            assert_eq!(n.props as usize, node.target().index(), "an alias's props is its target");
+            continue;
+        }
+        let p = props[n.props as usize];
+        assert_eq!((p.anchor_len > 0).then(|| text(p.anchor, p.anchor_len)), node.anchor(), "node {i}");
+        if p.tag_len > 0 {
+            assert_eq!(Some(text(p.tag, p.tag_len)), node.tag(), "node {i}");
+            tags += 1;
+        }
+        if n.flags & oyl::sys::OYL_NODE_POOLED != 0 {
+            assert_eq!(text(n.text, n.len), node.text(), "a rewritten scalar's text is in the pool");
+            assert_eq!(node.text(), b"q\tr");
+        }
+    }
+    assert_eq!(tags, 1);
+    assert_eq!(tree.root().get("a").unwrap().tag(), Some(&b"tag:x:t"[..]));
+}
+
+#[test]
 fn merges_too_costly_to_work_out() {
     // each mapping merges the one before and adds a key: 12 million pairs
     let mut yaml = String::from("m0: &m0 {k0: v}\n");

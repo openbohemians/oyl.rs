@@ -1,4 +1,4 @@
-use oyl::{Directives, EmitStyle, Emitter, ErrorKind, Event, EventKind, Mark, Parser, ScalarStyle, Schema};
+use oyl::{Directives, EmitStyle, Emitter, ErrorKind, Event, EventKind, Mark, Parser, ScalarStyle, Scanner, Schema, TokenKind};
 
 fn kinds_and_values(parser: &Parser) -> Vec<(EventKind, String)> {
     parser
@@ -307,4 +307,49 @@ fn parsers_and_emitters_are_send() {
     send::<Parser<'static>>();
     send::<Emitter>();
     send::<Schema>();
+    send::<Scanner<'static>>();
+}
+
+#[test]
+fn scanner_tokens() {
+    let input = "%TAG !e! tag:x:\n--- !e!a &x\nk: \"q\\n\" # c\nl: [*x, !!str 2]\n...\n";
+    let scanner = Scanner::new(input).unwrap();
+    let tokens: Vec<_> = scanner.tokens().map(|t| t.unwrap()).collect();
+    let got: Vec<_> = tokens.iter().map(|t| (t.kind, t.value_str().unwrap())).collect();
+    use TokenKind::*;
+    assert_eq!(got, [
+        (StreamStart, ""), (Directive, "%TAG !e! tag:x:"), (DocumentStart, ""), (Tag, "!e!a"), (Anchor, "x"),
+        (Scalar, "k"), (MappingValue, ""), (Scalar, "q\n"), (Scalar, "l"), (MappingValue, ""),
+        (FlowSequenceStart, ""), (Alias, "x"), (FlowEntry, ""), (Tag, "!!str"), (Scalar, "2"),
+        (FlowSequenceEnd, ""), (DocumentEnd, ""), (StreamEnd, ""),
+    ]);
+    let quoted = tokens[7];
+    assert_eq!(quoted.style, ScalarStyle::DoubleQuoted);
+    assert_eq!((quoted.start.line, quoted.start.column, quoted.end.column), (3, 4, 9));
+    assert!(scanner.next_token().unwrap().is_none(), "nothing after the stream's end");
+    assert_eq!(Scanner::new("").unwrap().tokens().count(), 2);
+}
+
+#[test]
+fn scanner_errors_have_a_position_and_end_the_tokens() {
+    let scanner = Scanner::new("a: \"x\n").unwrap();
+    let err = scanner.tokens().find_map(Result::err).expect("an error");
+    assert_eq!(err.kind(), ErrorKind::Scan);
+    assert!(err.message().contains("unterminated"), "{err}");
+    assert_eq!(err.mark().map(|m| m.line), Some(2));
+    assert!(scanner.next_token().unwrap().is_none(), "no tokens after an error");
+}
+
+#[test]
+fn tokens_outlive_later_calls() {
+    let scanner = Scanner::new("\"a\\tb\": c\n").unwrap();
+    let first = loop {
+        let t = scanner.next_token().unwrap().unwrap();
+        if t.kind == TokenKind::Scalar {
+            break t;
+        }
+    };
+    let rest: Vec<_> = scanner.tokens().map(|t| t.unwrap()).collect();
+    assert_eq!(first.value, b"a\tb", "rewritten text lives in the scanner");
+    assert_eq!(rest.len(), 3);
 }

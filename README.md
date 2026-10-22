@@ -62,6 +62,10 @@ for parse errors, the position. For `"a: 1\nb: [2, 3\n"`:
 expected ',' or ']' in flow sequence at line 3, column 1
 ```
 
+Below the parser, `Scanner` gives YAML's tokens (indicators, scalars,
+tags, anchors, directives) with their positions, for syntax highlighting
+and the like.
+
 ## Trees
 
 A tree holds a document in memory: look things up, walk it, and read
@@ -93,9 +97,11 @@ document's dialect. Keys are equal as YAML compares them, by tag and value:
 
 Text stays in the input, except what the parser rewrote (escapes, folded
 lines), which the tree keeps: a tree borrows the input, not the parser, so
-it can outlive the parser, and threads can share it. `raw_nodes()` gives
-Oyl's 32-byte nodes for walking without calls. `Emitter::tree` writes a
-tree back out as YAML.
+it can outlive the parser, and threads can share it. `raw_nodes()`,
+`raw_props()` and `raw_pool()` give Oyl's arrays (32-byte nodes, their tags
+and anchors, and the tree's own text) for walking without calls, with
+their types and constants in `oyl::sys`. `Emitter::tree` writes a tree
+back out as YAML.
 
 ## serde
 
