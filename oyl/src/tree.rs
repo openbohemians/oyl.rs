@@ -8,7 +8,7 @@ use std::str::Utf8Error;
 
 use oyl_sys as sys;
 
-use crate::{bytes, opt_bytes, raw_str, Dialect, Error, ErrorKind, Mark, Parser, ScalarStyle, State, Value};
+use crate::{bytes, opt_bytes, raw_str, Dialect, Directives, Error, ErrorKind, Mark, Parser, ScalarStyle, State, Value};
 
 /// A document in memory, read from a [`Parser`] with
 /// [`next_tree`](Parser::next_tree) or [`trees`](Parser::trees).
@@ -66,6 +66,19 @@ impl<'i> Tree<'i> {
     pub fn dialect(&self) -> Dialect<'_> {
         let d = unsafe { sys::oyl_tree_dialect(self.raw()) };
         Dialect(NonNull::new(d.cast_mut()).expect("a tree has a dialect"), PhantomData)
+    }
+
+    /// The document's `%YAML` and `%TAG` directives, which
+    /// [`Emitter::tree`](crate::Emitter::tree) writes with it.
+    pub fn directives(&self) -> Directives {
+        let t = self.raw();
+        // SAFETY: the strings are in the tree's pool
+        unsafe {
+            Directives::read(
+                |major, minor| sys::oyl_tree_yaml_version(t, major, minor),
+                |i, handle, prefix| sys::oyl_tree_tag_directive(t, i, handle, prefix),
+            )
+        }
     }
 
     /// Where the document starts in the input.
@@ -306,6 +319,12 @@ impl<'t> Node<'t> {
     /// (its last value), in the order keys first appear. Scalar keys are
     /// equal when their tags and values are, so `1` and `"1"` are two keys
     /// and `0x1` and `1` one; collection keys are all kept.
+    ///
+    /// The merges are worked out as the tree is built, within a bound on
+    /// that work which grows with the document. Past it, as for a long
+    /// chain of anchors each merging the one before, a mapping that merges
+    /// gives an [`ErrorKind::Limit`] error here, and [`get`](Node::get)
+    /// walks its merges instead.
     pub fn entries(&self) -> Result<Vec<(Node<'t>, Node<'t>)>, Error> {
         self.collect_entries(0)
     }
@@ -347,7 +366,7 @@ impl<'t> Node<'t> {
                 Err(e)
             }
             sys::OYL_ERR_INPUT => Err(self.error(ErrorKind::Input, "not a mapping")),
-            sys::OYL_ERR_LIMIT => Err(self.error(ErrorKind::Limit, "merges nested too deep or too costly")),
+            sys::OYL_ERR_LIMIT => Err(self.error(ErrorKind::Limit, "the document's merges were too costly to work out")),
             _ => Err(Error::from_status(status)),
         }
     }

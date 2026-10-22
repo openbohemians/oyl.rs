@@ -1,4 +1,4 @@
-use oyl::{EmitStyle, Emitter, ErrorKind, Event, EventKind, Mark, Parser, ScalarStyle, Schema};
+use oyl::{Directives, EmitStyle, Emitter, ErrorKind, Event, EventKind, Mark, Parser, ScalarStyle, Schema};
 
 fn kinds_and_values(parser: &Parser) -> Vec<(EventKind, String)> {
     parser
@@ -217,6 +217,88 @@ fn emitter_rejects_events_out_of_order() {
     let mut e = Emitter::new().unwrap();
     e.stream_start().unwrap();
     assert_eq!(e.mapping_end().unwrap_err().kind(), ErrorKind::Emit);
+}
+
+#[test]
+fn emitter_errors_are_final() {
+    let mut e = Emitter::new().unwrap();
+    e.stream_start().unwrap();
+    assert_eq!(e.alias("a b").unwrap_err().kind(), ErrorKind::Emit, "a name YAML can't hold");
+    assert_eq!(e.document_start(true).unwrap_err().kind(), ErrorKind::Emit, "every later call fails");
+    assert_eq!(e.stream_end().unwrap_err().kind(), ErrorKind::Emit);
+}
+
+#[test]
+fn emitter_rejects_directives_yaml_cant_take() {
+    let fails = |f: &dyn Fn(&mut Emitter) -> Result<(), oyl::Error>| {
+        let mut e = Emitter::new().unwrap();
+        e.stream_start().unwrap();
+        f(&mut e).unwrap_err().kind()
+    };
+    assert_eq!(fails(&|e| e.yaml_directive(2, 0)), ErrorKind::Emit, "not 1.x");
+    assert_eq!(fails(&|e| e.tag_directive("e", "tag:a:")), ErrorKind::Emit, "not a handle");
+    assert_eq!(fails(&|e| e.tag_directive("!e!", "")), ErrorKind::Emit, "an empty prefix");
+    assert_eq!(fails(&|e| { e.tag_directive("!e!", "tag:a:")?; e.tag_directive("!e!", "tag:b:") }),
+               ErrorKind::Emit, "a handle twice");
+    assert_eq!(fails(&|e| { e.document_start(true)?; e.yaml_directive(1, 1) }), ErrorKind::Emit,
+               "inside a document");
+}
+
+/// Each document's directives, as the parser gives them at its start.
+fn directives_of(input: &str) -> Vec<Directives> {
+    let parser = Parser::new(input).unwrap();
+    let mut all = Vec::new();
+    for event in parser.events() {
+        if event.unwrap().kind == EventKind::DocumentStart {
+            all.push(parser.directives());
+        }
+    }
+    all
+}
+
+/// Each node's tag, in order.
+fn tags_of(input: &str) -> Vec<Option<String>> {
+    let parser = Parser::new(input).unwrap();
+    let tags = parser
+        .events()
+        .map(|e| e.unwrap())
+        .filter(|e| matches!(e.kind, EventKind::Scalar | EventKind::MappingStart | EventKind::SequenceStart))
+        .map(|e| e.tag_str().map(|t| t.unwrap().to_owned()))
+        .collect();
+    tags
+}
+
+#[test]
+fn directives_survive_reemitting() {
+    let yaml = "%YAML 1.1\n%TAG !e! tag:example.com,2000:\n--- !e!x\na: !e!y yes\n...\n--- b\n";
+    let docs = directives_of(yaml);
+    assert_eq!(docs.len(), 2);
+    assert_eq!(docs[0].yaml_version, Some((1, 1)));
+    assert_eq!(docs[0].tags, [(b"!e!".to_vec(), b"tag:example.com,2000:".to_vec())]);
+    assert!(docs[1].is_empty(), "the second document has none");
+
+    let mut e = Emitter::new().unwrap();
+    e.reemit(&Parser::new(yaml).unwrap()).unwrap();
+    let out = String::from_utf8(e.output()).unwrap();
+    assert!(out.starts_with("%YAML 1.1\n%TAG !e! tag:example.com,2000:\n---"), "{out}");
+    assert!(out.contains("!e!x") && out.contains("!e!y"), "tags written with the handle: {out}");
+    assert_eq!(directives_of(&out), docs, "{out}");
+    assert_eq!(tags_of(&out), tags_of(yaml), "{out}");
+}
+
+#[test]
+fn directives_built_by_hand() {
+    let mut e = Emitter::new().unwrap();
+    e.stream_start().unwrap();
+    e.directives(&Directives { yaml_version: None, tags: vec![(b"!e!".to_vec(), b"tag:a b:".to_vec())] }).unwrap();
+    e.document_start(true).unwrap();
+    e.scalar("v", ScalarStyle::Plain, None, Some("tag:a b:x")).unwrap();
+    e.document_end(true).unwrap();
+    e.stream_end().unwrap();
+    let out = String::from_utf8(e.output()).unwrap();
+    // the prefix's space is %-escaped; the document gets "---"
+    assert_eq!(out, "%TAG !e! tag:a%20b:\n---\n!e!x v\n");
+    assert_eq!(tags_of(&out), [Some("tag:a b:x".to_owned())]);
 }
 
 #[test]

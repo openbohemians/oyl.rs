@@ -274,6 +274,73 @@ fn dialects() {
     assert_eq!(format!("{:?}", Dialect::yaml11()), "Dialect(yaml11)");
     assert_eq!(Dialect::goyaml2().schema().resolve(b"yes", ScalarStyle::Plain), b"tag:yaml.org,2002:bool");
     assert_eq!(Schema::yaml11().resolve(b"0b101", ScalarStyle::Plain), b"tag:yaml.org,2002:int");
+    assert_eq!(Dialect::yaml12().version(), (1, 2));
+    assert_eq!(Dialect::yaml11().version(), (1, 1));
+    assert_eq!(Dialect::goyaml2().version(), (1, 1));
+}
+
+#[test]
+fn a_documents_version_chooses_its_dialect() {
+    assert_eq!(tree_of("%YAML 1.1\n---\na: yes\n").dialect(), Dialect::yaml11());
+    assert_eq!(tree_of("a: yes\n").dialect(), Dialect::yaml12());
+    let mut parser = Parser::new("%YAML 1.2\n---\na: yes\n").unwrap();
+    parser.dialect(Dialect::yaml11());
+    assert_eq!(parser.next_tree().unwrap().unwrap().dialect(), Dialect::yaml12());
+    // go-yaml v2's dialect keeps a document of its version, and refuses others
+    let mut parser = Parser::new("%YAML 1.1\n---\na: yes\n").unwrap();
+    parser.dialect(Dialect::goyaml2());
+    assert_eq!(parser.next_tree().unwrap().unwrap().dialect(), Dialect::goyaml2());
+    let mut parser = Parser::new("%YAML 1.2\n---\na: yes\n").unwrap();
+    parser.dialect(Dialect::goyaml2());
+    assert_eq!(parser.next_tree().unwrap_err().kind(), ErrorKind::Parse);
+}
+
+#[test]
+fn a_tree_keeps_its_directives() {
+    let yaml = "%YAML 1.1\n%TAG !e! tag:example.com,2000:\n--- !e!x\na: !e!y yes\n";
+    let tree = tree_of(yaml);
+    let d = tree.directives();
+    assert_eq!(d.yaml_version, Some((1, 1)));
+    assert_eq!(d.tags, [(b"!e!".to_vec(), b"tag:example.com,2000:".to_vec())]);
+    assert!(tree_of("a: 1\n").directives().is_empty());
+
+    let mut e = Emitter::new().unwrap();
+    e.stream_start().unwrap();
+    e.tree(&tree).unwrap();
+    e.stream_end().unwrap();
+    let out = String::from_utf8(e.output()).unwrap();
+    assert!(out.starts_with("%YAML 1.1\n%TAG !e! tag:example.com,2000:\n---"), "{out}");
+    let again = tree_of(&out);
+    assert_eq!(again.directives(), d, "{out}");
+    assert_eq!(again.root().tag(), Some(&b"tag:example.com,2000:x"[..]));
+    assert_eq!(again.root().get("a").unwrap().value().unwrap(), Value::Str(b"yes"), "a local type keeps its text");
+
+    // a %TAG given first replaces the tree's for its handle; its %YAML stays
+    let mut e = Emitter::new().unwrap();
+    e.stream_start().unwrap();
+    e.tag_directive("!e!", "tag:other.org,2000:").unwrap();
+    e.tree(&tree).unwrap();
+    e.stream_end().unwrap();
+    let out = String::from_utf8(e.output()).unwrap();
+    assert!(out.starts_with("%YAML 1.1\n%TAG !e! tag:other.org,2000:\n---"), "{out}");
+    assert_eq!(tree_of(&out).root().tag(), Some(&b"tag:example.com,2000:x"[..]), "{out}");
+}
+
+#[test]
+fn merges_too_costly_to_work_out() {
+    // each mapping merges the one before and adds a key: 12 million pairs
+    let mut yaml = String::from("m0: &m0 {k0: v}\n");
+    for i in 1..=5000 {
+        yaml += &format!("m{i}: &m{i} {{<<: *m{}, k{i}: v}}\n", i - 1);
+    }
+    let mut parser = Parser::new(&yaml).unwrap();
+    parser.max_events(0);
+    let tree = parser.next_tree().unwrap().unwrap();
+    let last = tree.root().get("m5000").unwrap();
+    assert_eq!(last.entries().unwrap_err().kind(), ErrorKind::Limit);
+    assert_eq!(tree.root().get("m0").unwrap().entries().unwrap().len(), 1, "one that doesn't merge");
+    assert_eq!(last.get("k1").unwrap().text(), b"v", "a lookup walks the merges");
+    assert!(last.get("nope").is_none());
 }
 
 #[test]

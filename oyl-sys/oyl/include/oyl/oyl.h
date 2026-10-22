@@ -39,7 +39,7 @@ extern "C" {
 /* ── Version ─────────────────────────────────────────────── */
 
 #define OYL_VERSION_MAJOR 1
-#define OYL_VERSION_MINOR 0
+#define OYL_VERSION_MINOR 2
 #define OYL_VERSION_PATCH 0
 
 /* ── String view (zero-copy reference into source) ───────── */
@@ -164,7 +164,9 @@ typedef struct {
     oyl_str          anchor;      /**< Anchor name (@c &name) if present. */
     oyl_str          tag;         /**< Tag (@c !tag) if present. */
     oyl_scalar_style scalar_style;
-    bool             implicit;    /**< True for implicit doc start/end. */
+    bool             implicit;    /**< True for an implicit doc start/end, and for a
+                                       node whose tag the parser's schema gave
+                                       (oyl_parser_set_schema), not one written. */
     bool             flow;        /**< True for flow collections ({} / []). */
     oyl_mark         start;
     oyl_mark         end;
@@ -352,7 +354,10 @@ enum {
     OYL_INT_RANGE        = 1 << 8,  /**< decline a value beyond 64 bits (else it is text) */
     OYL_INT_DIGIT_UNDERSCORE = 1 << 9,  /**< underscores after the first digit or a prefix:
                                              1_000, 0x_1F (YAML 1.1) */
-    OYL_INT_BASE60       = 1 << 10, /**< 1:20 is 80, 190:20:30 is 685230 (YAML 1.1) */
+    OYL_INT_BASE60       = 1 << 10, /**< 1:20 is 80, 190:20:30 is 685230 (YAML 1.1); the
+                                         sign, underscore and range options apply */
+    OYL_INT_BIN_SIGN     = 1 << 11, /**< a sign after a lowercase 0b with none before it:
+                                         0b-101 is -5 (go-yaml v2) */
     /** The Core schema's ints (with a sign also allowed before 0x or 0o) */
     OYL_INT_CORE = OYL_INT_SIGN | OYL_INT_HEX | OYL_INT_OCT | OYL_INT_SIGN_PREFIX,
     /** YAML 1.1's ints (yaml.org/type/int) */
@@ -397,9 +402,11 @@ OYL_API void    oyl_schema_builder_add_type(oyl_schema_builder *b, oyl_str tag,
 /** The value of a scalar event. An untagged scalar (no schema on the
  *  parser) is resolved first; a tagged one is parsed by its tag's rules.
  *  Returns OYL_ERR_PARSE when none of them accepts it, as for
- *  @c !!int "abc", OYL_ERR_MEMORY if a long float can't be copied, and
- *  OYL_ERR_INPUT if @p scalar isn't a scalar event. A tag with no rules
- *  (!!str, !foo) gives the text. */
+ *  @c !!int "abc" (or for a YAML 1.1 timestamp that doesn't exist, see
+ *  oyl_schema_yaml11), and OYL_ERR_INPUT if @p scalar isn't a scalar event. A
+ *  tag with no rules (!!str, !foo) gives the text. YAML 1.1's and go-yaml
+ *  v2's schemas read a tagged scalar as their libraries do (see them).
+ *  Floats are read alike in any locale, and need no memory. */
 OYL_API oyl_status oyl_schema_value(const oyl_schema *schema, const oyl_event *scalar,
                                     oyl_value *out);
 
@@ -412,13 +419,20 @@ OYL_API oyl_status oyl_schema_value_of(const oyl_schema *schema, oyl_str text,
 /** YAML 1.1's types as PyYAML reads them, PyYAML being the usual loader
  *  on libyaml: yes/no/on/off booleans (not y/n, which yaml.org/type also
  *  lists), 0b binary, 0-octal, base 60, underscores, floats with a dot
- *  (.5, but not -.5), timestamps, << as !!merge and = as !!value. */
+ *  (.5, but not -.5), timestamps, << as !!merge and = as !!value. An
+ *  explicit tag reads its scalar as PyYAML's constructor for the type
+ *  does, more leniently than resolution: !!float 1 is 1.0, !!int 0o17 is
+ *  15, !!bool YeS is true, and anything tagged !!null is null. A timestamp
+ *  whose date or time doesn't exist, as 2001-02-29, has no value, tagged
+ *  or not (OYL_ERR_PARSE): PyYAML refuses it. */
 OYL_API const oyl_schema *oyl_schema_yaml11(void);
 
 /** go-yaml v2's types, as Kubernetes reads YAML: yes/no/on/off and y/n
- *  booleans, 0777 octal, 0b binary, underscores in numbers, an int beyond
- *  64 bits as a float, timestamps. Like go-yaml v2 it gives << no merge
- *  tag; merge keys are the parser's option (oyl_parser_set_merge). */
+ *  booleans, 0777 octal, 0b binary (0b-101 too), underscores in numbers,
+ *  an int beyond 64 bits as a float, timestamps. An explicit !!float
+ *  reads its scalar as if untagged and takes an int as a float, as
+ *  go-yaml v2 does (!!float 017 is 15). Like go-yaml v2 it gives << no
+ *  merge tag; merge keys are the parser's option (oyl_parser_set_merge). */
 OYL_API const oyl_schema *oyl_schema_goyaml2(void);
 
 /** The tag YAML gives timestamps. */
@@ -447,6 +461,9 @@ OYL_API oyl_parser *oyl_parser_new(const char *input, size_t len, oyl_arena *a);
  *  by the parser, valid until the next call or oyl_parser_free(); copy it
  *  (or the fields you need) to keep it longer. On error @p *evt is set to
  *  NULL. After OYL_EVT_STREAM_END every call returns a OYL_EVT_NONE event.
+ *  An error is final: every later call returns it again, with the same
+ *  oyl_parser_error(), as do oyl_parse_tree() and oyl_parse_json(),
+ *  whose own errors count too. The events delivered before it stand.
  *
  *  Events are produced incrementally as input is consumed, except when
  *  merge keys, alias resolution, a schema, directives, or node properties
@@ -457,7 +474,9 @@ OYL_API oyl_parser *oyl_parser_new(const char *input, size_t len, oyl_arena *a);
 OYL_API oyl_status  oyl_parse_next(oyl_parser *p, const oyl_event **evt);
 
 /** Set a tag schema for automatic tag resolution on scalars. The schema
- *  must outlive the parser. */
+ *  must outlive the parser. Without a default dialect, it types documents
+ *  with no %YAML or with %YAML 1.2 (see Dialects). Every node's event then
+ *  has a tag; one the schema gave is marked implicit. */
 OYL_API void        oyl_parser_set_schema(oyl_parser *p, const oyl_schema *schema);
 
 /** Enable/disable merge key (@c <<) expansion. Disabled by default.
@@ -503,13 +522,18 @@ OYL_API void        oyl_parser_free(oyl_parser *p);
 /* ── Dialects and warnings ───────────────────────────────── */
 
 /* A dialect is what varies between YAML worlds: a schema (types and
- * values), syntax leniencies, and how << merges. A document chooses its
- * dialect with directives, among those the program allows:
+ * values), syntax leniencies, and how << merges. Each is a dialect of one
+ * YAML version. A document chooses its dialect with directives, among
+ * those the program allows:
  *   1. %TAG !! <prefix>: the dialect registered for that prefix sets the
  *      types of explicit !! tags and of untagged values
- *   2. %YAML <version>: the version of the standard !! schema; 1.1 and 1.2
- *      are built in, other 1.x versions read as 1.2 with a warning
+ *   2. %YAML <version>: the program's dialect for that version: the one
+ *      registered for it, else the default if it is of that version (so
+ *      %YAML 1.1 keeps go-yaml v2, and %YAML 1.2 the schema set with
+ *      oyl_parser_set_schema), else the built-in one; other 1.x versions
+ *      read as 1.2, with a warning
  *   3. otherwise the parser's default dialect
+ * The document picks the version, the program the dialect for each.
  * (YAML 1.2 applies a %TAG !! prefix to explicit tags only; Oyl applies it
  * to untagged values as well, the intent of !! in YAML 1.2's design.) */
 
@@ -522,7 +546,9 @@ enum {
     OYL_SYNTAX_EOF_NO_BREAK  = 1 << 1,  /**< a block scalar ending the input gets no
                                              final line feed (libyaml, so PyYAML and
                                              go-yaml v2) */
-    OYL_SYNTAX_YAML11_ONLY   = 1 << 2,  /**< %YAML other than 1.1 is an error (go-yaml v2) */
+    OYL_SYNTAX_YAML11_ONLY   = 1 << 2,  /**< %YAML other than 1.1 is an error, in the
+                                             default dialect for every document but one
+                                             choosing a registered dialect (go-yaml v2) */
     /** go-yaml v2's */
     OYL_SYNTAX_GOYAML2 = OYL_SYNTAX_SQUOTE_ESCAPE | OYL_SYNTAX_EOF_NO_BREAK | OYL_SYNTAX_YAML11_ONLY,
 };
@@ -536,38 +562,52 @@ typedef enum {
     OYL_MERGE_ORDERED,  /**< go-yaml v2: a merge overrides the keys before it */
 } oyl_merge_order;
 
-/** A dialect, allocated in the arena. */
-OYL_API const oyl_dialect *oyl_dialect_new(oyl_arena *a, const oyl_schema *schema,
-                                           unsigned syntax, oyl_merge_order merge);
+/** A dialect of YAML @p version ("1.1", "1.2"), allocated in the arena.
+ *  NULL for a version not 1.x (or whose minor an int can't hold), or out
+ *  of memory. */
+OYL_API const oyl_dialect *oyl_dialect_new(oyl_arena *a, const char *version,
+                                           const oyl_schema *schema, unsigned syntax,
+                                           oyl_merge_order merge);
 OYL_API const oyl_schema *oyl_dialect_schema(const oyl_dialect *d);
 OYL_API unsigned          oyl_dialect_syntax(const oyl_dialect *d);
 OYL_API oyl_merge_order   oyl_dialect_merge(const oyl_dialect *d);
+/** The YAML version it is a dialect of. */
+OYL_API void              oyl_dialect_version(const oyl_dialect *d, int *major, int *minor);
 
 /** YAML 1.2: the Core schema, YAML 1.2's syntax, YAML's merge. */
 OYL_API const oyl_dialect *oyl_dialect_yaml12(void);
 /** YAML 1.1 with PyYAML's types (oyl_schema_yaml11) and YAML's merge: a
- *  document PyYAML reads gets the same values. Two exceptions: ints
- *  beyond 64 bits are text, and keys are equal as YAML has them, by tag
- *  and value, where Python's == also makes 1, 1.0 and true one key. The
- *  syntax is YAML 1.2's,
- *  but a block scalar ending the input gets no final line feed, as in
- *  libyaml. Malformed YAML that libyaml lets through stays an error, such
- *  as a comment touching a closing quote or bracket or a block scalar's
- *  header ("a"#c, [a]#c, |#c), or a quoted scalar or flow collection
- *  whose later lines aren't indented past the block it sits in. */
+ *  document PyYAML reads gets the same values. The exceptions: ints
+ *  beyond 64 bits are text, as is a base 60 !!int with a part beyond 64
+ *  bits even where later parts cancel it out; keys are equal as YAML has
+ *  them, by tag and value, where Python's == also makes 1, 1.0 and true
+ *  one key, and two timestamps of one instant written otherwise one key;
+ *  and a base 60 float of more than 14 parts may differ in its last bits.
+ *  The syntax is YAML 1.2's, but a block scalar ending the input gets no
+ *  final line feed, as in libyaml. Malformed YAML that libyaml lets
+ *  through stays an error, such as a comment touching a closing quote or
+ *  bracket or a block scalar's header ("a"#c, [a]#c, |#c), or a quoted
+ *  scalar or flow collection whose later lines aren't indented past the
+ *  block it sits in. */
 OYL_API const oyl_dialect *oyl_dialect_yaml11(void);
 /** go-yaml v2, as Kubernetes reads YAML: its types, its syntax
- *  leniencies (OYL_SYNTAX_GOYAML2), and its merge order. */
+ *  leniencies (OYL_SYNTAX_GOYAML2), and its merge order. A dialect of
+ *  YAML 1.1, as go-yaml v2 reads it. Its other libyaml quirks aren't
+ *  copied; as YAML 1.2 has it, NEL, U+2028 and U+2029 aren't line breaks,
+ *  the escape \/ and a raw DEL may be quoted, an anchor may hold a colon
+ *  (&a:b), and a zero-indented top-level block scalar keeps its text. */
 OYL_API const oyl_dialect *oyl_dialect_goyaml2(void);
 
-/** The default dialect, for documents whose directives choose none. Without
- *  one, it is YAML 1.2, with the schema of oyl_parser_set_schema if set. */
+/** The default dialect, for documents whose directives choose none, and
+ *  for those declaring its version (%YAML). Without one, it is YAML 1.2,
+ *  with the schema of oyl_parser_set_schema if set. */
 OYL_API void oyl_parser_set_dialect(oyl_parser *p, const oyl_dialect *d);
 
 /** Let documents choose @p d: by %YAML @p version ("1.1"), or by a
- *  %TAG !! @p tag_prefix; give one, the other NULL. A version replaces the
- *  built-in dialect for it. OYL_ERR_INPUT for both or neither or a prefix
- *  too long, OYL_ERR_LIMIT past 8 of each. */
+ *  %TAG !! @p tag_prefix; give one, the other NULL. A version's dialect
+ *  comes before the default and the built-in one for it. OYL_ERR_INPUT for
+ *  both or neither, a version not 1.x (as oyl_dialect_new) or a prefix too
+ *  long, OYL_ERR_LIMIT past 8 of each. */
 OYL_API oyl_status oyl_parser_add_dialect(oyl_parser *p, const oyl_dialect *d,
                                           const char *version, const char *tag_prefix);
 
@@ -578,6 +618,14 @@ OYL_API const oyl_dialect *oyl_parser_document_dialect(oyl_parser *p);
 
 /** Likewise the document's %YAML version; false if it has none. */
 OYL_API bool oyl_parser_yaml_version(oyl_parser *p, int *major, int *minor);
+
+/** Likewise the document's %TAG directive @p i (from 0): its handle
+ *  ("!e!") and its prefix, %-escapes decoded as in tags; false past the
+ *  last. The strings are the parser's: use them before reading on. To
+ *  re-emit a document, pass these and its %YAML version to
+ *  oyl_emit_tag_directive() and oyl_emit_yaml_directive() before its
+ *  DOC_START. */
+OYL_API bool oyl_parser_tag_directive(oyl_parser *p, int i, oyl_str *handle, oyl_str *prefix);
 
 /** What a warning is about. Codes may be added at the end. */
 typedef enum {
@@ -601,7 +649,8 @@ enum {
     OYL_JSON_MERGE       = 1 << 0,  /**< expand << merge keys; keys written in the mapping win */
     OYL_JSON_MERGE_ORDER = 1 << 1,  /**< with MERGE, as go-yaml v2: a merge overrides the
                                          keys before it, and keys after it override it */
-    OYL_JSON_STRICT      = 1 << 2,  /**< a key set twice is an error */
+    OYL_JSON_STRICT      = 1 << 2,  /**< a key set twice in any mapping is an error, as
+                                         are two keys that become one string (1, "1") */
     /** As Kubernetes reads YAML (sigs.k8s.io/yaml's YAMLToJSON), with
      *  oyl_schema_goyaml2() */
     OYL_JSON_KUBERNETES  = OYL_JSON_MERGE | OYL_JSON_MERGE_ORDER,
@@ -614,17 +663,27 @@ enum {
  *  the stream, returns OYL_OK with an empty @p json.
  *
  *  Keys are sorted by their bytes, and a key set twice keeps its last
- *  value (an error under OYL_JSON_STRICT); aliases are expanded, within
- *  go-yaml v2's limit on aliasing; numbers and strings are written as Go's
+ *  value (an error under OYL_JSON_STRICT; -0.0 and 0.0 are one key, as
+ *  in Go, written as the last one is); aliases are expanded, within
+ *  go-yaml v2's limit on aliasing, counted as go-yaml v2 counts it (in
+ *  YAML's merge, as written); in YAML's merge, each mapping merged, and
+ *  each sequence of them merged through an alias, is worked out once,
+ *  within the parser's bound on merges for events
+ *  with max_events off; numbers and strings are written as Go's
  *  encoding/json writes them. With oyl_schema_goyaml2() and
  *  OYL_JSON_KUBERNETES, the output is byte for byte that of
  *  sigs.k8s.io/yaml's YAMLToJSON for the first document.
  *
  *  Leave the parser's own merge and alias resolution off: this function
- *  does both. Errors it finds (a null or collection key, inf or NaN, an
- *  unknown anchor, a scalar its explicit tag rejects) are reported like
- *  parse errors, with oyl_parser_error() and oyl_parser_error_mark(): as
- *  OYL_ERR_PARSE, or OYL_ERR_LIMIT for too much aliasing or nesting. */
+ *  does both. Errors are reported like parse errors, with
+ *  oyl_parser_error() and oyl_parser_error_mark(): as OYL_ERR_PARSE, or
+ *  OYL_ERR_LIMIT for too much aliasing, merging or nesting (merges
+ *  chained count as nesting). Every node is checked as decoding it
+ *  checks it, as go-yaml v2 and PyYAML decode even the value of a key set
+ *  again later: a scalar its tag rejects, a collection as a key, a merge
+ *  of what isn't a mapping, an unknown anchor or one inside its own
+ *  value. What only JSON can't hold (a null or uint64 key, inf or NaN)
+ *  fails only where it would be written. */
 OYL_API oyl_status oyl_parse_json(oyl_parser *p, const oyl_schema *schema,
                                   unsigned flags, oyl_str *json);
 
@@ -641,7 +700,12 @@ OYL_API oyl_status oyl_parse_json(oyl_parser *p, const oyl_schema *schema,
  * arrays whole or read them in place. A finished tree is read-only, and
  * threads may share it. Aliases and << merge keys stay as written:
  * lookups follow aliases and apply merges in the order of the document's
- * dialect. */
+ * dialect. The merges are worked out as the tree is built, each mapping
+ * merged once however the merges nest, so reading a mapping costs its
+ * pairs. That work is bounded as the parser's merges for events are;
+ * past the bound nothing is kept: oyl_node_entries gives OYL_ERR_LIMIT
+ * for a mapping that merges, and oyl_node_get walks the merges, visiting
+ * each mapping once, at most the size of the tree. */
 
 typedef struct oyl_tree oyl_tree;
 
@@ -701,8 +765,9 @@ typedef struct {
  *  the input, and a schema or dialect given to the parser, must outlive
  *  it, but the parser need not. The parser's settings apply (dialects,
  *  limits, warnings); leave its merge and alias resolution off. Errors
- *  (the parser's, an alias to an unknown anchor, a document over 4 GB) are
- *  reported by oyl_parser_error() and oyl_parser_error_mark(). */
+ *  (the parser's, an alias to an unknown anchor, a document over 4 GB,
+ *  memory running out working out merges) are reported by
+ *  oyl_parser_error() and oyl_parser_error_mark(). */
 OYL_API oyl_status oyl_parse_tree(oyl_parser *p, oyl_tree **tree);
 
 /** Free a tree. */
@@ -724,6 +789,13 @@ OYL_API size_t oyl_tree_base(const oyl_tree *t);
 /** The document's dialect, which typed its scalars. */
 OYL_API const oyl_dialect *oyl_tree_dialect(const oyl_tree *t);
 
+/** The document's %YAML version; false if it has none. */
+OYL_API bool oyl_tree_yaml_version(const oyl_tree *t, int *major, int *minor);
+
+/** The document's %TAG directive @p i (from 0), as
+ *  oyl_parser_tag_directive() gives it; false past the last. */
+OYL_API bool oyl_tree_tag_directive(const oyl_tree *t, int i, oyl_str *handle, oyl_str *prefix);
+
 /** A scalar's text, or an alias's anchor name (empty for a collection). */
 OYL_API oyl_str oyl_node_text(const oyl_tree *t, uint32_t i);
 
@@ -735,8 +807,9 @@ OYL_API oyl_str oyl_node_tag(const oyl_tree *t, uint32_t i);
 OYL_API oyl_str oyl_node_anchor(const oyl_tree *t, uint32_t i);
 
 /** A scalar's value in the document's schema, through aliases. As
- *  oyl_schema_value(): OYL_ERR_PARSE if its explicit tag rejects it,
- *  OYL_ERR_INPUT if it isn't a scalar. */
+ *  oyl_schema_value(): OYL_ERR_PARSE if its explicit tag rejects it (or
+ *  it is a YAML 1.1 timestamp that doesn't exist), OYL_ERR_INPUT if it
+ *  isn't a scalar. */
 OYL_API oyl_status oyl_node_value(const oyl_tree *t, uint32_t i, oyl_value *v);
 
 /** Where a node starts: offset, line and column, as the parser's events
@@ -755,7 +828,8 @@ OYL_API uint32_t oyl_node_target(const oyl_tree *t, uint32_t i);
  *  value; << merges apply in the order of the document's dialect. A <<
  *  whose value can't be merged (not a mapping, an alias to one, or a
  *  sequence of those, which YAML's merge also takes through an alias) is
- *  an ordinary key. */
+ *  an ordinary key. OYL_NO_NODE also if memory runs out walking merges
+ *  too costly to work out. */
 OYL_API uint32_t oyl_node_get(const oyl_tree *t, uint32_t map, oyl_str key);
 
 /** As oyl_node_get(), for the key equal to @p key: a scalar of its kind's
@@ -777,8 +851,9 @@ enum {
  *  values are (YAML 1.2.2 §3.2.1.3), so 1 and "1" are two keys and 0x1
  *  and 1 one; collection keys are all kept. Returns OYL_ERR_PARSE under
  *  OYL_ENTRIES_STRICT for a repeated key, the error YAML makes it, with
- *  @p *n the first key written again; OYL_ERR_LIMIT for merges nested
- *  too deep or too costly; OYL_ERR_INPUT if @p map isn't a mapping. */
+ *  @p *n the first key written again; OYL_ERR_LIMIT if @p map merges and
+ *  the document's merges were too costly to work out; OYL_ERR_MEMORY;
+ *  OYL_ERR_INPUT if @p map isn't a mapping. */
 OYL_API oyl_status oyl_node_entries(const oyl_tree *t, uint32_t map, unsigned flags,
                                     oyl_arena *a, const oyl_pair **pairs, size_t *n);
 
@@ -808,16 +883,48 @@ OYL_API void         oyl_emitter_set_indent(oyl_emitter *e, int indent);
 /* Events are fed in the same well-formed order the parser produces:
  * STREAM_START (DOC_START node DOC_END)* STREAM_END. Anchor and tag
  * arguments may be OYL_STR_NULL. Tags are full tags (e.g.
- * "tag:yaml.org,2002:str", written as !!str) or local tags ("!foo"). */
+ * "tag:yaml.org,2002:str", written as !!str) or local tags ("!foo"),
+ * written with the document's %TAG handles where they fit.
+ * Events in another order (two roots, a mapping ended after a key, an end
+ * that doesn't match its start), and anchor or alias names YAML can't
+ * hold (empty, or with blanks, flow indicators or control characters),
+ * are OYL_ERR_EMIT. An error is final: every later call returns it, and
+ * the output so far may be incomplete. A mapping key longer than YAML
+ * allows an implicit key (1024 characters, its anchor and tag included)
+ * is written explicit ("? key"). */
 
 /** Re-emit an event obtained from oyl_parse_next() (e.g. to reformat a
- *  document). To build output yourself, use the functions below. */
+ *  document). A document's directives aren't among its events: see
+ *  oyl_parser_tag_directive(). To build output yourself, use the
+ *  functions below. */
 OYL_API oyl_status   oyl_emit(oyl_emitter *e, const oyl_event *evt);
 
 OYL_API oyl_status   oyl_emit_stream_start(oyl_emitter *e);
 OYL_API oyl_status   oyl_emit_stream_end(oyl_emitter *e);
 
-/** Start a document; @p implicit omits the "---" marker. */
+/** Write a %YAML directive for the next document: @p major must be 1. A
+ *  document without one is YAML 1.2 to a YAML 1.2 reader; one with it
+ *  chooses that version's dialect in Oyl (see Dialects), but go-yaml v2
+ *  and v3 reject a %YAML other than 1.1, and libyaml reads YAML 1.1
+ *  whatever it says. Call it, and oyl_emit_tag_directive(), between
+ *  documents, before oyl_emit_document_start(): a document with
+ *  directives starts with "---", and the one before it ends with "...".
+ *  One %YAML per document; a directive and no document after it, or
+ *  given inside one, is OYL_ERR_EMIT. */
+OYL_API oyl_status   oyl_emit_yaml_directive(oyl_emitter *e, int major, int minor);
+
+/** Write a %TAG directive for the next document: @p handle is "!", "!!"
+ *  or "!name!" (letters, digits, '-'), @p prefix the tags it stands for,
+ *  written with %-escapes where YAML needs them. The document's tags are
+ *  written with its handles where they fit, and with "!" and "!!" only as
+ *  its directives define them (otherwise verbatim, "!<...>"). One per
+ *  handle, at most 8 per document, as long as the parser reads (handle
+ *  under 16 bytes, prefix as written under 256); otherwise OYL_ERR_EMIT. */
+OYL_API oyl_status   oyl_emit_tag_directive(oyl_emitter *e, oyl_str handle, oyl_str prefix);
+
+/** Start a document; @p implicit omits the "---" marker where YAML
+ *  allows: not after a document that ended without "...", not for an
+ *  empty one, and not with directives. */
 OYL_API oyl_status   oyl_emit_document_start(oyl_emitter *e, bool implicit);
 
 /** End a document; @p implicit omits the "..." marker. */
@@ -826,7 +933,11 @@ OYL_API oyl_status   oyl_emit_document_end(oyl_emitter *e, bool implicit);
 /** Emit a scalar. OYL_SCALAR_PLAIN writes the value plain when that reads
  *  back as the same text, and quotes it otherwise; the other styles are
  *  honored where valid (block styles fall back to double-quoted in flow
- *  context). */
+ *  context). Characters YAML doesn't allow unescaped (control characters
+ *  but tab and line feed, DEL, the C1 controls, U+FEFF, U+FFFE, U+FFFF),
+ *  and NEL, U+2028 and U+2029, which YAML 1.1 reads as line breaks, are
+ *  written escaped, in double quotes. The emitter doesn't decode UTF-8:
+ *  invalid UTF-8 is written as it is. */
 OYL_API oyl_status   oyl_emit_scalar(oyl_emitter *e, oyl_str value,
                                      oyl_scalar_style style,
                                      oyl_str anchor, oyl_str tag);
@@ -844,14 +955,18 @@ OYL_API oyl_status   oyl_emit_sequence_start(oyl_emitter *e, oyl_str anchor,
                                              oyl_str tag, bool flow);
 OYL_API oyl_status   oyl_emit_sequence_end(oyl_emitter *e);
 
-/** Emit a tree as one document, with "---" and "..." where they were
- *  written; call it between oyl_emit_stream_start() and
- *  oyl_emit_stream_end(). The output is what the document's events give,
- *  but for a parser with a schema (oyl_parser_set_schema()): its events
- *  tag every node, and the tree keeps only the tags written. */
+/** Emit a tree as one document, with its %YAML and %TAG directives, and
+ *  "---" and "..." where they were written; call it between
+ *  oyl_emit_stream_start() and oyl_emit_stream_end(). Directives given
+ *  for it already (oyl_emit_yaml_directive(), oyl_emit_tag_directive())
+ *  take the place of its own. The output is what the document's events
+ *  give, but for a parser with a schema (oyl_parser_set_schema()): its
+ *  events tag every node, and the tree keeps only the tags written. */
 OYL_API oyl_status   oyl_emit_tree(oyl_emitter *e, const oyl_tree *t);
 
-/** Retrieve the emitter's output buffer. Valid until the arena is freed. */
+/** The emitter's output so far, copied into the emitter's arena and valid
+ *  until that is freed. Its data is NULL only when the copy can't be
+ *  allocated (or for a NULL emitter). */
 OYL_API oyl_str      oyl_emitter_output(oyl_emitter *e);
 
 /** Free the emitter (does not free the arena). */

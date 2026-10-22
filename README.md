@@ -9,7 +9,8 @@ Two crates:
 - **`oyl`**: the safe API. A pull parser whose events come from an iterator,
   documents as trees with lookups and typed values, dialects (YAML 1.2,
   YAML 1.1, go-yaml v2 as Kubernetes reads YAML), YAML to JSON, errors that
-  say where they happened, and an emitter.
+  say where they happened, and an emitter that keeps documents' `%YAML`
+  and `%TAG` directives.
 - **`oyl-sys`**: the raw C declarations, mirroring `oyl.h`. It compiles Oyl
   from sources vendored in the crate, so nothing needs to be installed; a C
   compiler is enough.
@@ -148,7 +149,9 @@ A dialect decides which types scalars get and how `<<` merges: YAML 1.2's
 core schema by default; YAML 1.1 with PyYAML's types and merge (`yes` and
 `on` are booleans, `0777` is octal), so a document PyYAML reads gets the
 same values (with two exceptions, in `Dialect::yaml11`'s docs); or go-yaml
-v2's, as Kubernetes reads YAML. A document starting with `%YAML 1.1` reads as YAML 1.1.
+v2's, as Kubernetes reads YAML. A document's `%YAML 1.1` or `%YAML 1.2`
+chooses that version's dialect when the parser's is of another version
+(go-yaml v2's refuses any but 1.1, as go-yaml v2 does).
 
 ```rust
 use oyl::{Dialect, Parser, Value};
@@ -190,9 +193,17 @@ e.stream_end()?;
 assert_eq!(e.output(), b"name: oyl\n");
 ```
 
-`Emitter::event` re-emits a parser's events, so a document can be
-reformatted (`style`, `indent`). The output always parses back to the same
-data: a plain scalar stays plain only when it reads back as the same text.
+`Emitter::reemit` re-emits a parser's events, each document with its
+`%YAML` and `%TAG` directives, so a document can be reformatted (`style`,
+`indent`); `Emitter::tree` writes a tree with its directives. To emit
+events one at a time, give `Parser::directives` to `Emitter::directives`
+at each document's start, then `Emitter::event`.
+
+The output reads back as the events given: a plain scalar stays plain
+only when it reads back as the same text, a document's tags are written
+with its `%TAG` handles, and so on. Events out of order, and names or
+directives YAML can't hold, are `ErrorKind::Emit` errors; an error is
+final, so every later call returns it.
 
 `cargo run --example events -- file.yaml` prints a file's events.
 

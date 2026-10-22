@@ -200,6 +200,7 @@ pub const OYL_INT_UNDERSCORE: c_uint = 1 << 7;
 pub const OYL_INT_RANGE: c_uint = 1 << 8;
 pub const OYL_INT_DIGIT_UNDERSCORE: c_uint = 1 << 9;
 pub const OYL_INT_BASE60: c_uint = 1 << 10;
+pub const OYL_INT_BIN_SIGN: c_uint = 1 << 11;
 pub const OYL_INT_CORE: c_uint = OYL_INT_SIGN | OYL_INT_HEX | OYL_INT_OCT | OYL_INT_SIGN_PREFIX;
 pub const OYL_INT_YAML11: c_uint = OYL_INT_SIGN | OYL_INT_HEX | OYL_INT_OCT_ZERO | OYL_INT_BIN
     | OYL_INT_SIGN_PREFIX | OYL_INT_DIGIT_UNDERSCORE | OYL_INT_BASE60;
@@ -382,10 +383,17 @@ extern "C" {
     pub fn oyl_parser_error_mark(p: *mut oyl_parser) -> oyl_mark;
     pub fn oyl_parser_free(p: *mut oyl_parser);
 
-    pub fn oyl_dialect_new(a: *mut oyl_arena, schema: *const oyl_schema, syntax: c_uint, merge: oyl_merge_order) -> *const oyl_dialect;
+    pub fn oyl_dialect_new(
+        a: *mut oyl_arena,
+        version: *const c_char,
+        schema: *const oyl_schema,
+        syntax: c_uint,
+        merge: oyl_merge_order,
+    ) -> *const oyl_dialect;
     pub fn oyl_dialect_schema(d: *const oyl_dialect) -> *const oyl_schema;
     pub fn oyl_dialect_syntax(d: *const oyl_dialect) -> c_uint;
     pub fn oyl_dialect_merge(d: *const oyl_dialect) -> oyl_merge_order;
+    pub fn oyl_dialect_version(d: *const oyl_dialect, major: *mut c_int, minor: *mut c_int);
     pub fn oyl_dialect_yaml12() -> *const oyl_dialect;
     pub fn oyl_dialect_yaml11() -> *const oyl_dialect;
     pub fn oyl_dialect_goyaml2() -> *const oyl_dialect;
@@ -393,6 +401,7 @@ extern "C" {
     pub fn oyl_parser_add_dialect(p: *mut oyl_parser, d: *const oyl_dialect, version: *const c_char, tag_prefix: *const c_char) -> oyl_status;
     pub fn oyl_parser_document_dialect(p: *mut oyl_parser) -> *const oyl_dialect;
     pub fn oyl_parser_yaml_version(p: *mut oyl_parser, major: *mut c_int, minor: *mut c_int) -> bool;
+    pub fn oyl_parser_tag_directive(p: *mut oyl_parser, i: c_int, handle: *mut oyl_str, prefix: *mut oyl_str) -> bool;
     pub fn oyl_parser_set_warn(p: *mut oyl_parser, fn_: oyl_warn_fn, user: *mut c_void);
 
     pub fn oyl_parse_json(p: *mut oyl_parser, schema: *const oyl_schema, flags: c_uint, json: *mut oyl_str) -> oyl_status;
@@ -404,6 +413,8 @@ extern "C" {
     pub fn oyl_tree_pool(t: *const oyl_tree) -> oyl_str;
     pub fn oyl_tree_base(t: *const oyl_tree) -> usize;
     pub fn oyl_tree_dialect(t: *const oyl_tree) -> *const oyl_dialect;
+    pub fn oyl_tree_yaml_version(t: *const oyl_tree, major: *mut c_int, minor: *mut c_int) -> bool;
+    pub fn oyl_tree_tag_directive(t: *const oyl_tree, i: c_int, handle: *mut oyl_str, prefix: *mut oyl_str) -> bool;
     pub fn oyl_node_text(t: *const oyl_tree, i: u32) -> oyl_str;
     pub fn oyl_node_tag(t: *const oyl_tree, i: u32) -> oyl_str;
     pub fn oyl_node_anchor(t: *const oyl_tree, i: u32) -> oyl_str;
@@ -430,6 +441,8 @@ extern "C" {
     pub fn oyl_emit_sequence_start(e: *mut oyl_emitter, anchor: oyl_str, tag: oyl_str, flow: bool) -> oyl_status;
     pub fn oyl_emit_sequence_end(e: *mut oyl_emitter) -> oyl_status;
     pub fn oyl_emit_tree(e: *mut oyl_emitter, t: *const oyl_tree) -> oyl_status;
+    pub fn oyl_emit_yaml_directive(e: *mut oyl_emitter, major: c_int, minor: c_int) -> oyl_status;
+    pub fn oyl_emit_tag_directive(e: *mut oyl_emitter, handle: oyl_str, prefix: oyl_str) -> oyl_status;
     pub fn oyl_emitter_output(e: *mut oyl_emitter) -> oyl_str;
     pub fn oyl_emitter_free(e: *mut oyl_emitter);
 

@@ -24,7 +24,8 @@
 //! ```
 //!
 //! The [`Emitter`] writes YAML from events, or re-emits a parser's, here
-//! with a wider indent (each collection keeps its flow or block style):
+//! with a wider indent (each collection keeps its flow or block style, and
+//! each document its `%YAML` and `%TAG` directives):
 //!
 //! ```
 //! use oyl::{Emitter, Parser};
@@ -32,9 +33,7 @@
 //! let parser = Parser::new("a:\n  - 1\n  - 2\nb: {c: d}\n")?;
 //! let mut emitter = Emitter::new()?;
 //! emitter.indent(4);
-//! for event in parser.events() {
-//!     emitter.event(&event?)?;
-//! }
+//! emitter.reemit(&parser)?;
 //! assert_eq!(String::from_utf8(emitter.output())?, "a:\n    - 1\n    - 2\nb: {c: d}\n");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -254,6 +253,51 @@ fn raw_str(s: Option<&[u8]>) -> sys::oyl_str {
     }
 }
 
+// ── Directives ──────────────────────────────────────────────
+
+/// A document's directives: its `%YAML` version and its `%TAG` handles.
+/// They aren't among its events: [`Parser::directives`] and
+/// [`Tree::directives`] give them, and [`Emitter::directives`] writes them
+/// for the next document.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Directives {
+    /// `%YAML major.minor`, if the document has one.
+    pub yaml_version: Option<(u32, u32)>,
+    /// Each `%TAG` handle (`!e!`) and the prefix it stands for, %-escapes
+    /// decoded as in tags, in the order written.
+    pub tags: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Directives {
+    /// Neither `%YAML` nor `%TAG`.
+    pub fn is_empty(&self) -> bool {
+        self.yaml_version.is_none() && self.tags.is_empty()
+    }
+
+    /// From the C accessors: `version` fills a `%YAML` version, `tag` the
+    /// `%TAG` directive it's asked for, each saying whether there is one.
+    ///
+    /// # Safety
+    /// The strings `tag` gives must be readable until it is called again.
+    unsafe fn read(
+        version: impl FnOnce(&mut c_int, &mut c_int) -> bool,
+        mut tag: impl FnMut(c_int, &mut sys::oyl_str, &mut sys::oyl_str) -> bool,
+    ) -> Self {
+        let part = |n: c_int| u32::try_from(n).unwrap_or(0);
+        let (mut major, mut minor) = (0, 0);
+        let yaml_version = version(&mut major, &mut minor).then(|| (part(major), part(minor)));
+        let mut tags = Vec::new();
+        let none = sys::oyl_str { data: std::ptr::null(), len: 0 };
+        let (mut handle, mut prefix) = (none, none);
+        let mut i = 0;
+        while tag(i, &mut handle, &mut prefix) {
+            tags.push((bytes(handle).to_vec(), bytes(prefix).to_vec()));
+            i += 1;
+        }
+        Directives { yaml_version, tags }
+    }
+}
+
 // ── Values ──────────────────────────────────────────────────
 
 /// A scalar's value, as a schema types it.
@@ -386,7 +430,8 @@ pub enum ErrorKind {
     Scan,
     /// Malformed YAML, found by the parser.
     Parse,
-    /// Events fed to the emitter out of order.
+    /// The emitter was given events out of order, a name YAML can't hold
+    /// as an anchor or alias, or a directive it can't take.
     Emit,
     /// A safety limit was exceeded: the event count, nesting depth, or
     /// alias and merge expansion. See [`Parser::max_events`].
@@ -566,9 +611,11 @@ pub enum MergeOrder {
 }
 
 /// What varies between YAML worlds: a schema (which types scalars get),
-/// syntax leniencies, and how `<<` merges. A document reads by the
-/// parser's dialect, unless it starts with `%YAML 1.1`, which chooses
-/// [`Dialect::yaml11`]: YAML 1.1 with PyYAML's types and merge.
+/// syntax leniencies, and how `<<` merges, for one YAML version. A
+/// document reads by the parser's dialect ([`Parser::dialect`]), unless
+/// its `%YAML` directive names another version: `%YAML 1.1` then chooses
+/// [`Dialect::yaml11`], YAML 1.1 with PyYAML's types and merge, and
+/// `%YAML 1.2` [`Dialect::yaml12`].
 ///
 /// The presets are `Dialect<'static>`; a [`Tree`]'s dialect borrows from
 /// the tree (the parser may have made it from a [`Schema`] alone, and the
@@ -625,6 +672,13 @@ impl Dialect<'_> {
     /// The schema that types its scalars.
     pub fn schema(&self) -> Schema {
         Schema::preset(unsafe { sys::oyl_dialect_schema(self.0.as_ptr()) })
+    }
+
+    /// The YAML version it is a dialect of: `(1, 2)` for YAML 1.2.
+    pub fn version(&self) -> (u32, u32) {
+        let (mut major, mut minor) = (0, 0);
+        unsafe { sys::oyl_dialect_version(self.0.as_ptr(), &mut major, &mut minor) };
+        (u32::try_from(major).unwrap_or(0), u32::try_from(minor).unwrap_or(0))
     }
 
     /// How it applies `<<` merge keys.
@@ -762,8 +816,13 @@ impl<'i> Parser<'i> {
         self
     }
 
-    /// Read documents by this dialect, unless one starts with `%YAML 1.1`,
-    /// which chooses [`Dialect::yaml11`]. Trees and JSON type scalars by it.
+    /// Read documents by this dialect, unless one's `%YAML` directive names
+    /// another version: `%YAML 1.1` then chooses [`Dialect::yaml11`] and
+    /// `%YAML 1.2` [`Dialect::yaml12`] (other 1.x versions read as 1.2).
+    /// go-yaml v2's dialect, of YAML 1.1, refuses any `%YAML` but 1.1, as
+    /// go-yaml v2 does. Without a dialect, the parser reads YAML 1.2 by
+    /// its [`schema`](Parser::schema) if set. Trees and JSON type scalars
+    /// by the document's dialect.
     pub fn dialect(&mut self, dialect: Dialect<'static>) -> &mut Self {
         unsafe { sys::oyl_parser_set_dialect(self.parser.as_ptr(), dialect.0.as_ptr()) };
         self
@@ -845,6 +904,24 @@ impl<'i> Parser<'i> {
         Events { parser: self }
     }
 
+    /// The directives of the document whose
+    /// [`DocumentStart`](EventKind::DocumentStart) came last: ask when that
+    /// event arrives (the parser may read ahead, so by the document's end
+    /// they may be the next one's). To re-emit the document with them,
+    /// give them to [`Emitter::directives`] before its `DocumentStart`, or
+    /// use [`Emitter::reemit`].
+    pub fn directives(&self) -> Directives {
+        let p = self.parser.as_ptr();
+        // SAFETY: the strings are the parser's until it reads on, and are
+        // copied before then
+        unsafe {
+            Directives::read(
+                |major, minor| sys::oyl_parser_yaml_version(p, major, minor),
+                |i, handle, prefix| sys::oyl_parser_tag_directive(p, i, handle, prefix),
+            )
+        }
+    }
+
     fn error(&self, status: sys::oyl_status) -> Error {
         let p = self.parser.as_ptr();
         // SAFETY: Oyl's error message is NULL or a C string owned by the parser
@@ -903,8 +980,13 @@ pub enum EmitStyle {
 /// Writes YAML from events, fed in the order a parser produces them:
 /// `stream_start`, then documents, then `stream_end`.
 ///
-/// Its output always parses back to the same data: scalars are quoted when
-/// plain style would read back differently, and so on.
+/// Its output reads back as the events it was given: scalars are quoted
+/// when plain style would read back differently, a document gets `---`
+/// where YAML needs one, and so on. Events in another order (two roots, a
+/// mapping ended after a key, an end that doesn't match its start), anchor
+/// or alias names YAML can't hold, and directives it can't take are
+/// [`ErrorKind::Emit`] errors. An error is final: every later call returns
+/// it, and the output so far may be incomplete.
 pub struct Emitter {
     arena: NonNull<sys::oyl_arena>,
     emitter: NonNull<sys::oyl_emitter>,
@@ -995,7 +1077,10 @@ impl Emitter {
         check(unsafe { sys::oyl_emit_sequence_end(self.e()) })
     }
 
-    /// Emit a parsed event, e.g. to reformat a document.
+    /// Emit a parsed event, e.g. to reformat a document. A document's
+    /// directives aren't among its events: give the parser's
+    /// [`directives`](Parser::directives) at its `DocumentStart`, or use
+    /// [`reemit`](Emitter::reemit).
     pub fn event(&mut self, event: &Event<'_>) -> Result<(), Error> {
         match event.kind {
             EventKind::StreamStart => self.stream_start(),
@@ -1011,10 +1096,64 @@ impl Emitter {
         }
     }
 
-    /// Emit a tree as one document, with `---` and `...` where they were
-    /// written: what emitting its document's events would write.
+    /// Re-emit the rest of a parser's events, each document with its
+    /// directives: the input reformatted ([`style`](Emitter::style),
+    /// [`indent`](Emitter::indent)).
+    pub fn reemit(&mut self, parser: &Parser<'_>) -> Result<(), Error> {
+        for event in parser.events() {
+            let event = event?;
+            if event.kind == EventKind::DocumentStart {
+                self.directives(&parser.directives())?;
+            }
+            self.event(&event)?;
+        }
+        Ok(())
+    }
+
+    /// Emit a tree as one document, with its `%YAML` and `%TAG` directives,
+    /// and `---` and `...` where they were written: what emitting its
+    /// document's events would write. Directives given for it first
+    /// ([`directives`](Emitter::directives)) take the place of its own: a
+    /// `%YAML` given replaces the tree's, and a `%TAG` given replaces the
+    /// tree's for the same handle.
     pub fn tree(&mut self, tree: &Tree<'_>) -> Result<(), Error> {
         check(unsafe { sys::oyl_emit_tree(self.e(), tree.raw()) })
+    }
+
+    /// Directives for the next document, given between documents (before
+    /// its [`document_start`](Emitter::document_start)). The document then
+    /// starts with `---`, and the one before it ends with `...` if it needs
+    /// to. Its tags are written with its handles where they fit (`!e!foo`),
+    /// and with `!` and `!!` only as it defines them, otherwise verbatim.
+    /// The emitter writes no `%YAML` of its own: a document without one is
+    /// YAML 1.2 to a YAML 1.2 reader.
+    pub fn directives(&mut self, directives: &Directives) -> Result<(), Error> {
+        if let Some((major, minor)) = directives.yaml_version {
+            self.yaml_directive(major, minor)?;
+        }
+        for (handle, prefix) in &directives.tags {
+            self.raw_tag_directive(handle, prefix)?;
+        }
+        Ok(())
+    }
+
+    /// `%YAML major.minor` for the next document (see
+    /// [`directives`](Emitter::directives)). An [`ErrorKind::Emit`] error
+    /// inside a document, for a version not 1.x, or for a second one.
+    pub fn yaml_directive(&mut self, major: u32, minor: u32) -> Result<(), Error> {
+        check(unsafe { sys::oyl_emit_yaml_directive(self.e(), clamp_int(major), clamp_int(minor)) })
+    }
+
+    /// `%TAG handle prefix` for the next document (see
+    /// [`directives`](Emitter::directives)). The prefix is as tags have it:
+    /// what isn't a URI character is %-escaped when written. An
+    /// [`ErrorKind::Emit`] error inside a document; for a handle not `!`,
+    /// `!!` or `!name!` (letters, digits and `-`), or given twice for the
+    /// document; for an empty prefix; and past what Oyl's parser reads
+    /// back: more than 8 handles, a handle of 16 bytes or more, or a prefix
+    /// of 256 bytes or more as written.
+    pub fn tag_directive(&mut self, handle: &str, prefix: &str) -> Result<(), Error> {
+        self.raw_tag_directive(handle.as_bytes(), prefix.as_bytes())
     }
 
     /// The YAML written so far.
@@ -1028,6 +1167,10 @@ impl Emitter {
 
     fn raw_scalar(&mut self, value: &[u8], style: ScalarStyle, anchor: Option<&[u8]>, tag: Option<&[u8]>) -> Result<(), Error> {
         check(unsafe { sys::oyl_emit_scalar(self.e(), raw_str(Some(value)), style.raw(), raw_str(anchor), raw_str(tag)) })
+    }
+
+    fn raw_tag_directive(&mut self, handle: &[u8], prefix: &[u8]) -> Result<(), Error> {
+        check(unsafe { sys::oyl_emit_tag_directive(self.e(), raw_str(Some(handle)), raw_str(Some(prefix))) })
     }
 
     fn raw_alias(&mut self, name: &[u8]) -> Result<(), Error> {
