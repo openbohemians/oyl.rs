@@ -163,6 +163,40 @@ assert_eq!(tree.root().get("enabled").unwrap().value()?, Value::Bool(true));
 assert_eq!(tree.root().get("mode").unwrap().value()?, Value::Int(0o644));
 ```
 
+A program can build its own: a schema from words, the built-in number
+parsers with their options, and types of its own (`SchemaBuilder`), and a
+dialect from a schema, syntax leniencies and a merge order
+(`CustomDialect`). Here YAML 1.2 with sizes such as `4Ki` as a type, and
+`<<` an ordinary key:
+
+```rust
+use oyl::{CustomDialect, FloatFlags, IntFlags, MergeOrder, Parser, SchemaBuilder, Syntax, Value};
+
+let schema = SchemaBuilder::new()
+    .nulls(&["null", "~", ""])
+    .bools(&["true"], &["false"])
+    .custom("tag:example.com,2000:size", |text: &[u8]| {
+        let n: i64 = std::str::from_utf8(text.strip_suffix(b"Ki")?).ok()?.parse().ok()?;
+        Some(Value::Int(n * 1024))
+    })
+    .ints(IntFlags::CORE)
+    .floats(FloatFlags::CORE)
+    .build()?;
+let dialect = CustomDialect::new((1, 2), schema.schema(), Syntax::NONE, MergeOrder::None)?;
+let mut parser = Parser::new("memory: 4Ki\n")?;
+parser.dialect(dialect.dialect());
+let tree = parser.next_tree()?.unwrap();
+assert_eq!(tree.root().get("memory").unwrap().value()?, Value::Int(4096));
+```
+
+A parser, and the trees it reads, can't outlive a schema or dialect given
+to it. Documents can also choose a dialect by their `%YAML` version
+(`Parser::dialect_for_version`) or by a `%TAG !!` prefix
+(`Parser::dialect_for_tag_prefix`), and `Parser::document_dialect` says
+which one a document got. `Parser::on_warning` reports what the parser
+read but YAML 1.2 would read otherwise: a leniency of the dialect, a
+`%YAML` version it reads as another, a `%TAG !!` prefix with no dialect.
+
 ## YAML to JSON
 
 `next_json` writes the next document as JSON. With

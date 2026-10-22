@@ -61,7 +61,7 @@ pub fn from_str<'de, T: Deserialize<'de>>(input: &'de str) -> Result<T, Error> {
 
 /// As [`from_str`], reading by `dialect`: with [`Dialect::goyaml2`], as
 /// Kubernetes reads YAML (`enabled: yes` is a bool, `mode: 0644` octal).
-pub fn from_str_with<'de, T: Deserialize<'de>>(input: &'de str, dialect: Dialect<'static>) -> Result<T, Error> {
+pub fn from_str_with<'de, T: Deserialize<'de>>(input: &'de str, dialect: Dialect<'_>) -> Result<T, Error> {
     from_slice_with(input.as_bytes(), dialect)
 }
 
@@ -71,7 +71,7 @@ pub fn from_slice<'de, T: Deserialize<'de>>(input: &'de [u8]) -> Result<T, Error
 }
 
 /// As [`from_str_with`], from bytes.
-pub fn from_slice_with<'de, T: Deserialize<'de>>(input: &'de [u8], dialect: Dialect<'static>) -> Result<T, Error> {
+pub fn from_slice_with<'de, T: Deserialize<'de>>(input: &'de [u8], dialect: Dialect<'_>) -> Result<T, Error> {
     let mut parser = Parser::new(input)?;
     // a tree keeps aliases, so its events don't grow beyond the input
     parser.dialect(dialect).max_events(0);

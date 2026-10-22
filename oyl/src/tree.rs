@@ -8,7 +8,7 @@ use std::str::Utf8Error;
 
 use oyl_sys as sys;
 
-use crate::{bytes, opt_bytes, raw_str, Dialect, Directives, Error, ErrorKind, Mark, Parser, ScalarStyle, State, Value};
+use crate::{bytes, opt_bytes, raw_str, resume_panic, Dialect, Directives, Error, ErrorKind, Mark, Parser, ScalarStyle, State, Value};
 
 /// A document in memory, read from a [`Parser`] with
 /// [`next_tree`](Parser::next_tree) or [`trees`](Parser::trees).
@@ -214,6 +214,7 @@ impl<'t> Node<'t> {
     pub fn value(&self) -> Result<Value<'t>, Error> {
         let mut v = std::mem::MaybeUninit::<sys::oyl_value>::uninit();
         let status = unsafe { sys::oyl_node_value(self.tree.raw(), self.i, v.as_mut_ptr()) };
+        resume_panic();
         match status {
             sys::OYL_OK => {
                 // SAFETY: on success the value is set, and its text is the
@@ -263,6 +264,7 @@ impl<'t> Node<'t> {
     /// apply in the document's dialect's order.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Option<Node<'t>> {
         let i = unsafe { sys::oyl_node_get(self.tree.raw(), self.i, raw_str(Some(key.as_ref()))) };
+        resume_panic();
         (i != sys::OYL_NO_NODE).then_some(Node { tree: self.tree, i })
     }
 
@@ -273,6 +275,7 @@ impl<'t> Node<'t> {
     pub fn get_value(&self, key: Value<'_>) -> Option<Node<'t>> {
         let raw = key.raw();
         let i = unsafe { sys::oyl_node_get_value(self.tree.raw(), self.i, &raw) };
+        resume_panic();
         (i != sys::OYL_NO_NODE).then_some(Node { tree: self.tree, i })
     }
 
@@ -337,10 +340,15 @@ impl<'t> Node<'t> {
     }
 
     fn collect_entries(&self, flags: std::ffi::c_uint) -> Result<Vec<(Node<'t>, Node<'t>)>, Error> {
-        let arena = NonNull::new(unsafe { sys::oyl_arena_new(4096) }).ok_or_else(Error::memory)?;
-        let out = self.entries_in(arena, flags);
-        unsafe { sys::oyl_arena_free(arena.as_ptr()) };
-        out
+        // freed when dropped, so also when a custom type's panic goes on
+        struct Arena(NonNull<sys::oyl_arena>);
+        impl Drop for Arena {
+            fn drop(&mut self) {
+                unsafe { sys::oyl_arena_free(self.0.as_ptr()) };
+            }
+        }
+        let arena = Arena(NonNull::new(unsafe { sys::oyl_arena_new(4096) }).ok_or_else(Error::memory)?);
+        self.entries_in(arena.0, flags)
     }
 
     /// The entries, with the C pairs allocated in `arena` (which the caller
@@ -349,6 +357,7 @@ impl<'t> Node<'t> {
         let mut pairs: *const sys::oyl_pair = std::ptr::null();
         let mut n: usize = 0;
         let status = unsafe { sys::oyl_node_entries(self.tree.raw(), self.i, flags, arena.as_ptr(), &mut pairs, &mut n) };
+        resume_panic();
         match status {
             sys::OYL_OK => {
                 // SAFETY: on success `pairs` holds `n` pairs, in the arena
@@ -468,16 +477,26 @@ impl<'i> Parser<'i> {
         if self.state.get() != State::Parsing {
             return Ok(None);
         }
+        // freed when dropped, so also when a callback's panic goes on
+        struct Owned(NonNull<sys::oyl_tree>);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                unsafe { sys::oyl_tree_free(self.0.as_ptr()) };
+            }
+        }
         let mut raw: *mut sys::oyl_tree = std::ptr::null_mut();
         let status = unsafe { sys::oyl_parse_tree(self.parser.as_ptr(), &mut raw) };
+        let owned = NonNull::new(raw).map(Owned);
+        resume_panic();
         if status != sys::OYL_OK {
             self.state.set(State::Failed);
             return Err(self.error(status));
         }
-        let Some(raw) = NonNull::new(raw) else {
+        let Some(owned) = owned else {
             self.state.set(State::Done);
             return Ok(None);
         };
+        let raw = std::mem::ManuallyDrop::new(owned).0;
         let mut count = 0u32;
         let nodes = unsafe { sys::oyl_tree_nodes(raw.as_ptr(), &mut count) };
         if nodes.is_null() || count == 0 {

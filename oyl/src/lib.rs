@@ -53,6 +53,9 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! A program can build its own schemas ([`SchemaBuilder`]), with types of
+//! its own, and dialects ([`CustomDialect`]).
+//!
 //! With the `serde` feature, `oyl::from_str` and friends
 //! deserialize YAML into your types, from its tree (see the `de` module).
 //!
@@ -63,16 +66,20 @@
 // docs.rs (nightly, --cfg docsrs) labels what a feature enables
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+use std::any::Any;
 use std::cell::Cell;
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::str::Utf8Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use oyl_sys as sys;
 
+mod custom;
 mod tree;
+pub use custom::{CustomDialect, CustomSchema, FloatFlags, IntFlags, SchemaBuilder, Syntax};
 pub use tree::{Items, Node, NodeKind, Pairs, Tree, Trees};
 
 #[cfg(feature = "serde")]
@@ -295,6 +302,45 @@ impl Directives {
             i += 1;
         }
         Directives { yaml_version, tags }
+    }
+}
+
+// ── Callbacks ───────────────────────────────────────────────
+
+// A panic in a Rust callback that Oyl calls (a custom type's parser, a
+// warning handler) can't unwind through C: the callback catches it and
+// leaves it here, and the call into C that led to it resumes it on return.
+
+thread_local! {
+    static PANIC: Cell<Option<Box<dyn Any + Send>>> = const { Cell::new(None) };
+}
+
+/// Whether a callback was ever set, so that calls into C needn't look for
+/// a panic otherwise.
+static CALLBACKS: AtomicBool = AtomicBool::new(false);
+
+/// Run a callback for C: its result, or `fallback` if it panicked, the
+/// panic kept for [`resume_panic`].
+fn guard<R>(fallback: R, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(payload) => {
+            PANIC.with(|p| {
+                let first = p.take();
+                p.set(first.or(Some(payload)));
+            });
+            fallback
+        }
+    }
+}
+
+/// After a call into C that may have called back into Rust: a callback's
+/// panic goes on from here.
+fn resume_panic() {
+    if CALLBACKS.load(Ordering::Relaxed) {
+        if let Some(payload) = PANIC.with(Cell::take) {
+            std::panic::resume_unwind(payload);
+        }
     }
 }
 
@@ -524,14 +570,17 @@ fn clamp_int(n: u32) -> c_int {
 
 /// A tag schema: given to a parser, it resolves the tags of untagged
 /// nodes (`42` becomes `tag:yaml.org,2002:int` under the core schema).
-#[derive(Clone, Copy)]
-pub struct Schema(NonNull<sys::oyl_schema>);
+///
+/// The presets are `Schema<'static>`; one a program built borrows from its
+/// [`CustomSchema`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Schema<'a>(NonNull<sys::oyl_schema>, PhantomData<&'a sys::oyl_schema>);
 
-// SAFETY: the presets are static and never change
-unsafe impl Send for Schema {}
-unsafe impl Sync for Schema {}
+// SAFETY: a schema is never changed; a built one's parsers are Send + Sync
+unsafe impl Send for Schema<'_> {}
+unsafe impl Sync for Schema<'_> {}
 
-impl Schema {
+impl Schema<'static> {
     /// YAML 1.2 failsafe: everything is `!!str`, `!!seq` or `!!map`.
     pub fn failsafe() -> Self {
         Schema::preset(unsafe { sys::oyl_schema_failsafe() })
@@ -563,32 +612,37 @@ impl Schema {
     }
 
     fn preset(p: *const sys::oyl_schema) -> Self {
-        Schema(NonNull::new(p.cast_mut()).expect("Oyl's preset schemas are static"))
+        Schema(NonNull::new(p.cast_mut()).expect("Oyl's preset schemas are static"), PhantomData)
     }
+}
 
+impl<'a> Schema<'a> {
     /// The tag this schema gives a scalar with this value and style:
     /// quoted scalars are strings, plain ones are matched against the rules.
-    pub fn resolve(&self, value: &[u8], style: ScalarStyle) -> &'static [u8] {
-        // SAFETY: a preset's tags are static strings
-        unsafe { bytes(sys::oyl_schema_resolve(self.0.as_ptr(), raw_str(Some(value)), style.raw())) }
+    pub fn resolve(&self, value: &[u8], style: ScalarStyle) -> &'a [u8] {
+        // SAFETY: a schema's tags are static or in its arena, which lives for 'a
+        let tag = unsafe { bytes(sys::oyl_schema_resolve(self.0.as_ptr(), raw_str(Some(value)), style.raw())) };
+        resume_panic();
+        tag
     }
 
     /// The value this schema gives a scalar written as `text` in `style`,
     /// with `tag` (`None`: untagged, so resolved first). An error if the
     /// tag's rules reject the text (`!!int abc`); a tag with no rules gives
     /// the text.
-    pub fn value<'a>(&self, text: &'a [u8], style: ScalarStyle, tag: Option<&[u8]>) -> Result<Value<'a>, Error> {
+    pub fn value<'t>(&self, text: &'t [u8], style: ScalarStyle, tag: Option<&[u8]>) -> Result<Value<'t>, Error> {
         let mut v = std::mem::MaybeUninit::<sys::oyl_value>::uninit();
         let status = unsafe {
             sys::oyl_schema_value_of(self.0.as_ptr(), raw_str(Some(text)), style.raw(), raw_str(tag), v.as_mut_ptr())
         };
+        resume_panic();
         check(status)?;
         // SAFETY: on success the value is set; text points into `text`
         Ok(unsafe { Value::from_raw(&v.assume_init(), text) })
     }
 }
 
-impl fmt::Debug for Schema {
+impl fmt::Debug for Schema<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Schema")
     }
@@ -610,6 +664,16 @@ pub enum MergeOrder {
     Ordered,
 }
 
+impl MergeOrder {
+    pub(crate) fn raw(self) -> sys::oyl_merge_order {
+        match self {
+            MergeOrder::None => sys::OYL_MERGE_NONE,
+            MergeOrder::Yaml => sys::OYL_MERGE_YAML,
+            MergeOrder::Ordered => sys::OYL_MERGE_ORDERED,
+        }
+    }
+}
+
 /// What varies between YAML worlds: a schema (which types scalars get),
 /// syntax leniencies, and how `<<` merges, for one YAML version. A
 /// document reads by the parser's dialect ([`Parser::dialect`]), unless
@@ -617,9 +681,10 @@ pub enum MergeOrder {
 /// [`Dialect::yaml11`], YAML 1.1 with PyYAML's types and merge, and
 /// `%YAML 1.2` [`Dialect::yaml12`].
 ///
-/// The presets are `Dialect<'static>`; a [`Tree`]'s dialect borrows from
-/// the tree (the parser may have made it from a [`Schema`] alone, and the
-/// tree keeps a copy), so it can't outlive the tree:
+/// The presets are `Dialect<'static>`; one a program built borrows from its
+/// [`CustomDialect`], and a [`Tree`]'s dialect borrows from the tree (the
+/// parser may have made it from a [`Schema`] alone, and the tree keeps a
+/// copy), so it can't outlive the tree:
 ///
 /// ```compile_fail
 /// let parser = oyl::Parser::new("a: 1").unwrap();
@@ -668,10 +733,16 @@ impl Dialect<'static> {
     }
 }
 
-impl Dialect<'_> {
+impl<'a> Dialect<'a> {
     /// The schema that types its scalars.
-    pub fn schema(&self) -> Schema {
-        Schema::preset(unsafe { sys::oyl_dialect_schema(self.0.as_ptr()) })
+    pub fn schema(&self) -> Schema<'a> {
+        let s = unsafe { sys::oyl_dialect_schema(self.0.as_ptr()) };
+        Schema(NonNull::new(s.cast_mut()).expect("a dialect has a schema"), PhantomData)
+    }
+
+    /// The syntax leniencies it takes on.
+    pub fn syntax(&self) -> Syntax {
+        Syntax::from_bits(unsafe { sys::oyl_dialect_syntax(self.0.as_ptr()) })
     }
 
     /// The YAML version it is a dialect of: `(1, 2)` for YAML 1.2.
@@ -710,10 +781,10 @@ impl fmt::Debug for Dialect<'_> {
 
 /// How [`Parser::next_json`] writes a document as JSON.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct JsonOptions {
+pub struct JsonOptions<'a> {
     /// The schema that types scalars; `None` types them by the document's
     /// dialect, whose merge order then applies.
-    pub schema: Option<Schema>,
+    pub schema: Option<Schema<'a>>,
     /// Expand `<<` merge keys (with a schema; a dialect decides itself).
     pub merge: bool,
     /// With `merge`, go-yaml v2's order: a merge overrides the keys before it.
@@ -722,13 +793,15 @@ pub struct JsonOptions {
     pub strict: bool,
 }
 
-impl JsonOptions {
+impl JsonOptions<'static> {
     /// As Kubernetes reads YAML: byte for byte what sigs.k8s.io/yaml's
     /// `YAMLToJSON` writes.
     pub fn kubernetes() -> Self {
         JsonOptions { schema: Some(Schema::goyaml2()), merge: true, merge_ordered: true, strict: false }
     }
+}
 
+impl JsonOptions<'_> {
     fn flags(&self) -> std::ffi::c_uint {
         let mut f = 0;
         if self.merge { f |= sys::OYL_JSON_MERGE; }
@@ -736,6 +809,73 @@ impl JsonOptions {
         if self.strict { f |= sys::OYL_JSON_STRICT; }
         f
     }
+}
+
+// ── Warnings ────────────────────────────────────────────────
+
+/// What a [`Warning`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WarningKind {
+    /// A `%YAML` 1.x version other than 1.1 or 1.2, read as YAML 1.2.
+    YamlVersion,
+    /// A `%TAG !!` prefix no dialect was given for
+    /// ([`Parser::dialect_for_tag_prefix`]): untagged values keep the
+    /// standard types.
+    Dialect,
+    /// The dialect accepted what YAML 1.2 doesn't (go-yaml v2's `\'`, say).
+    Leniency,
+    /// In go-yaml v2's merge order, a merge overrode a key written before
+    /// it, which YAML's merge would keep.
+    MergeOrder,
+    /// A kind this version doesn't know.
+    Other,
+}
+
+impl WarningKind {
+    fn from_raw(code: sys::oyl_warning) -> Self {
+        match code {
+            sys::OYL_WARN_YAML_VERSION => WarningKind::YamlVersion,
+            sys::OYL_WARN_DIALECT => WarningKind::Dialect,
+            sys::OYL_WARN_LENIENCY => WarningKind::Leniency,
+            sys::OYL_WARN_MERGE_ORDER => WarningKind::MergeOrder,
+            _ => WarningKind::Other,
+        }
+    }
+}
+
+/// Something the parser read that YAML 1.2 would read otherwise, or not at
+/// all: see [`Parser::on_warning`]. Parsing goes on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Warning {
+    /// What it is about.
+    pub kind: WarningKind,
+    /// Oyl's description of it.
+    pub message: String,
+    /// Where in the input.
+    pub mark: Mark,
+}
+
+impl fmt::Display for Warning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} at line {}, column {}", self.message, self.mark.line, self.mark.column)
+    }
+}
+
+type WarnFn = Box<dyn FnMut(&Warning) + Send>;
+
+/// Oyl calls this for each warning, with the parser's handler.
+unsafe extern "C" fn warn_handler(user: *mut c_void, code: sys::oyl_warning, mark: sys::oyl_mark, message: *const c_char) {
+    // SAFETY: `user` is the handler the parser owns, called only from
+    // within the parser's own calls; the message is a C string for this call
+    let f = &mut *user.cast::<WarnFn>();
+    let warning = Warning {
+        kind: WarningKind::from_raw(code),
+        message: c_string(message).unwrap_or_default(),
+        mark: mark.into(),
+    };
+    guard((), || f(&warning));
 }
 
 // ── Parser ──────────────────────────────────────────────────
@@ -752,15 +892,20 @@ enum State {
 /// Set options (merge keys, alias resolution, a schema, limits) before
 /// reading the first event. After the stream ends, or after an error, it
 /// yields no more events.
+///
+/// The parser's lifetime `'i` is that of its input and of any schema or
+/// dialect given to it: trees read with it keep pointers to them.
 pub struct Parser<'i> {
     arena: NonNull<sys::oyl_arena>,
     parser: NonNull<sys::oyl_parser>,
     state: Cell<State>,
+    warn: Option<NonNull<WarnFn>>,
     _input: PhantomData<&'i [u8]>,
 }
 
-// SAFETY: the parser and its arena belong to this value alone and the
-// input is shared immutably; next_event takes &self, so it isn't Sync.
+// SAFETY: the parser, its arena and its warning handler (Send) belong to
+// this value alone, and the input, schemas and dialects are shared
+// immutably; next_event takes &self, so it isn't Sync.
 unsafe impl Send for Parser<'_> {}
 
 impl<'i> Parser<'i> {
@@ -771,7 +916,7 @@ impl<'i> Parser<'i> {
             .ok_or_else(Error::memory)?;
         let parser = unsafe { sys::oyl_parser_new(input.as_ptr().cast(), input.len(), arena.as_ptr()) };
         match NonNull::new(parser) {
-            Some(parser) => Ok(Parser { arena, parser, state: Cell::new(State::Parsing), _input: PhantomData }),
+            Some(parser) => Ok(Parser { arena, parser, state: Cell::new(State::Parsing), warn: None, _input: PhantomData }),
             None => {
                 unsafe { sys::oyl_arena_free(arena.as_ptr()) };
                 Err(Error::memory())
@@ -810,8 +955,9 @@ impl<'i> Parser<'i> {
         self
     }
 
-    /// Resolve the tags of untagged nodes with this schema.
-    pub fn schema(&mut self, schema: Schema) -> &mut Self {
+    /// Resolve the tags of untagged nodes with this schema; without a
+    /// [`dialect`](Parser::dialect), documents are typed by it too.
+    pub fn schema(&mut self, schema: Schema<'i>) -> &mut Self {
         unsafe { sys::oyl_parser_set_schema(self.parser.as_ptr(), schema.0.as_ptr()) };
         self
     }
@@ -823,9 +969,75 @@ impl<'i> Parser<'i> {
     /// go-yaml v2 does. Without a dialect, the parser reads YAML 1.2 by
     /// its [`schema`](Parser::schema) if set. Trees and JSON type scalars
     /// by the document's dialect.
-    pub fn dialect(&mut self, dialect: Dialect<'static>) -> &mut Self {
+    pub fn dialect(&mut self, dialect: Dialect<'i>) -> &mut Self {
         unsafe { sys::oyl_parser_set_dialect(self.parser.as_ptr(), dialect.0.as_ptr()) };
         self
+    }
+
+    /// Let documents choose `dialect` with `%YAML major.minor`: it comes
+    /// before the parser's dialect and the built-in one for that version.
+    /// Given again for a version, it replaces the one before. An
+    /// [`ErrorKind::Input`] error for a version not 1.x, and
+    /// [`ErrorKind::Limit`] past 8 versions.
+    pub fn dialect_for_version(&mut self, version: (u32, u32), dialect: Dialect<'i>) -> Result<&mut Self, Error> {
+        let v = CString::new(format!("{}.{}", version.0, version.1)).expect("digits and a dot");
+        check(unsafe { sys::oyl_parser_add_dialect(self.parser.as_ptr(), dialect.0.as_ptr(), v.as_ptr(), std::ptr::null()) })?;
+        Ok(self)
+    }
+
+    /// Let documents choose `dialect` with `%TAG !! prefix`, before
+    /// anything their `%YAML` says: a document can then name a project's
+    /// own types as `!!name`. The document's prefix is compared %-escapes
+    /// decoded. Given again for a prefix, it replaces the one before. An
+    /// [`ErrorKind::Input`] error for a prefix of 256 bytes or more, or
+    /// holding a NUL byte, and [`ErrorKind::Limit`] past 8 prefixes.
+    pub fn dialect_for_tag_prefix(&mut self, prefix: &str, dialect: Dialect<'i>) -> Result<&mut Self, Error> {
+        let prefix = CString::new(prefix).map_err(|_| Error {
+            kind: ErrorKind::Input,
+            message: "a %TAG prefix holding a NUL byte".into(),
+            mark: None,
+        })?;
+        check(unsafe { sys::oyl_parser_add_dialect(self.parser.as_ptr(), dialect.0.as_ptr(), std::ptr::null(), prefix.as_ptr()) })?;
+        Ok(self)
+    }
+
+    /// Call `f` with each [`Warning`]: what the parser read, but YAML 1.2
+    /// would read otherwise (a `%YAML` version it reads as another, a
+    /// `%TAG !!` prefix with no dialect given for it, a leniency of the
+    /// dialect, a merge go-yaml v2's order reads otherwise). Warnings don't
+    /// stop parsing. A panic in `f` goes on from the call that was reading.
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    /// use oyl::{Parser, WarningKind};
+    ///
+    /// let seen = Arc::new(Mutex::new(Vec::new()));
+    /// let mut parser = Parser::new("%YAML 1.3\n--- a\n")?;
+    /// let log = Arc::clone(&seen);
+    /// parser.on_warning(move |w| log.lock().unwrap().push(w.kind));
+    /// parser.next_tree()?;
+    /// assert_eq!(*seen.lock().unwrap(), [WarningKind::YamlVersion]);
+    /// # Ok::<(), oyl::Error>(())
+    /// ```
+    pub fn on_warning(&mut self, f: impl FnMut(&Warning) + Send + 'static) -> &mut Self {
+        let handler: WarnFn = Box::new(f);
+        let user = NonNull::from(Box::leak(Box::new(handler)));
+        CALLBACKS.store(true, Ordering::Relaxed);
+        unsafe { sys::oyl_parser_set_warn(self.parser.as_ptr(), Some(warn_handler), user.as_ptr().cast()) };
+        if let Some(old) = self.warn.replace(user) {
+            // SAFETY: leaked from a box above, and no longer Oyl's
+            drop(unsafe { Box::from_raw(old.as_ptr()) });
+        }
+        self
+    }
+
+    /// The dialect of the document whose
+    /// [`DocumentStart`](EventKind::DocumentStart) came last: ask when that
+    /// event arrives (the parser may read ahead, so by the document's end it
+    /// may be the next one's). Before the first document, YAML 1.2's.
+    pub fn document_dialect(&self) -> Dialect<'_> {
+        let d = unsafe { sys::oyl_parser_document_dialect(self.parser.as_ptr()) };
+        NonNull::new(d.cast_mut()).map_or(Dialect::yaml12(), |d| Dialect(d, PhantomData))
     }
 
     /// The next document as JSON; `Ok(None)` once the stream has ended.
@@ -833,13 +1045,14 @@ impl<'i> Parser<'i> {
     /// expanded, and numbers and strings are written as Go's encoding/json
     /// writes them. Leave [`merge`](Parser::merge) and
     /// [`resolve`](Parser::resolve) off: this does both.
-    pub fn next_json(&self, options: &JsonOptions) -> Result<Option<&str>, Error> {
+    pub fn next_json(&self, options: &JsonOptions<'_>) -> Result<Option<&str>, Error> {
         if self.state.get() != State::Parsing {
             return Ok(None);
         }
         let mut json = sys::oyl_str { data: std::ptr::null(), len: 0 };
         let schema = options.schema.map_or(std::ptr::null(), |s| s.0.as_ptr().cast_const());
         let status = unsafe { sys::oyl_parse_json(self.parser.as_ptr(), schema, options.flags(), &mut json) };
+        resume_panic();
         if status != sys::OYL_OK {
             self.state.set(State::Failed);
             return Err(self.error(status));
@@ -864,6 +1077,7 @@ impl<'i> Parser<'i> {
         }
         let mut raw: *const sys::oyl_event = std::ptr::null();
         let status = unsafe { sys::oyl_parse_next(self.parser.as_ptr(), &mut raw) };
+        resume_panic();
         if status != sys::OYL_OK || raw.is_null() {
             self.state.set(State::Failed);
             return Err(self.error(status));
@@ -937,6 +1151,10 @@ impl Drop for Parser<'_> {
         unsafe {
             sys::oyl_parser_free(self.parser.as_ptr());
             sys::oyl_arena_free(self.arena.as_ptr());
+        }
+        if let Some(handler) = self.warn.take() {
+            // SAFETY: leaked from a box in on_warning; the parser is gone
+            drop(unsafe { Box::from_raw(handler.as_ptr()) });
         }
     }
 }
