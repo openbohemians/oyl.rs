@@ -184,8 +184,10 @@ struct oyl_parser {
     parser_state node_return;  /* where to go after a block node completes */
     int          events_delivered; /* events returned to caller (for eager fallback skip) */
     uint64_t     delivered_sig;    /* running signature of their types */
-    oyl_status   scan_error;      /* last scanner error (for incremental path) */
+    oyl_status   scan_error;      /* the scanner's first error (for incremental path) */
     int          scan_error_out;  /* out_len when scan_error was hit */
+    oyl_mark     scan_error_mark; /* and its place and message (see next_event) */
+    char         scan_error_msg[256];
     size_t       value_colon_line; /* line of the last block map value ':' */
     bool         value_colon_starts_line; /* and whether it starts that line */
 
@@ -335,17 +337,26 @@ static inline ctx_entry *top_ctx(oyl_parser *p) {
 
 /* ── Token access ────────────────────────────────────────── */
 
+/* Keep the scanner's error. Only its first stands: called again, the
+ * scanner goes on from inside the bad token */
+NOINLINE void scan_failed(oyl_parser *p, oyl_status st) {
+    if (p->scan_error) return;
+    const char *smsg = oyl_scanner_error(p->scanner);
+    if (smsg) {
+        snprintf(p->error_msg, sizeof(p->error_msg), "%s", smsg);
+        p->error_mark = oyl_scanner_error_mark(p->scanner);
+    }
+    p->scan_error = st; /* save for incremental path error detection */
+    p->scan_error_out = p->out_len;
+    p->scan_error_mark = p->error_mark;
+    memcpy(p->scan_error_msg, p->error_msg, sizeof(p->scan_error_msg));
+}
+
 static inline oyl_status peek_token(oyl_parser *p) {
     if (p->have_token) return OYL_OK;
     oyl_status st = oyl_scan_token(p->scanner, &p->current);
     if (st != OYL_OK) {
-        const char *smsg = oyl_scanner_error(p->scanner);
-        if (smsg) {
-            snprintf(p->error_msg, sizeof(p->error_msg), "%s", smsg);
-            p->error_mark = oyl_scanner_error_mark(p->scanner);
-        }
-        p->scan_error = st; /* save for incremental path error detection */
-        p->scan_error_out = p->out_len;
+        scan_failed(p, st);
         return st;
     }
     p->have_token = true;
@@ -5013,9 +5024,12 @@ static oyl_status next_event(oyl_parser *p, oyl_event *evt) {
     while (p->out_len == 0) {
         oyl_status st = parser_step(p);
         if (p->scan_error) {
-            /* keep only events produced before the error; states may emit
-             * more after a failed peek, based on a stale token */
+            /* keep only events produced before the error, and its message;
+             * states may go on after a failed peek, from a stale token, and
+             * emit more or fail on it */
             p->out_len = p->scan_error_out;
+            p->error_mark = p->scan_error_mark;
+            memcpy(p->error_msg, p->scan_error_msg, sizeof(p->error_msg));
             if (p->out_len > 0) break; /* drain valid events first */
             return p->scan_error;
         }

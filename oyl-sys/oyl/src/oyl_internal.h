@@ -300,7 +300,8 @@ void oyl_warn(oyl_warn_state *w, oyl_warning code, oyl_mark mark, const char *ms
 /* ── Scanner ─────────────────────────────────────────────── */
 
 /* Scan the next token into caller-provided storage. oyl_scan_next() wraps
- * this for the public API; the parser calls it directly. */
+ * this for the public API, making its errors final; the parser calls it
+ * directly and keeps the first error itself. */
 oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok);
 /* The syntax leniencies to apply (OYL_SYNTAX_), and where to warn of their
  * use; the parser sets them per document. */

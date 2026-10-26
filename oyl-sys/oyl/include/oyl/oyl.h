@@ -217,7 +217,9 @@ OYL_API oyl_scanner *oyl_scanner_new(const char *input, size_t len, oyl_arena *a
 /** Retrieve the next token. On OYL_OK, @p *tok points to a token owned by
  *  the scanner, valid until the next call or oyl_scanner_free(); on error
  *  it is set to NULL. Returns OYL_OK, OYL_ERR_SCAN on malformed input, or
- *  OYL_ERR_MEMORY on allocation failure. */
+ *  OYL_ERR_MEMORY on allocation failure. An error is final: every later
+ *  call returns it again, with the same oyl_scanner_error() and
+ *  oyl_scanner_error_mark(). */
 OYL_API oyl_status   oyl_scan_next(oyl_scanner *s, const oyl_token **tok);
 
 /** Error message from the last failed scan, or NULL. */

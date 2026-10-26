@@ -268,7 +268,11 @@ enum {
     SC_HASH  = 1 << 4,
     SC_FLOW  = 1 << 5,   /* , [ ] { } */
     SC_UNI   = 1 << 6,   /* a lead byte of a character escaped_char() finds */
+    SC_ESC   = 1 << 7,   /* a character escaped_char() finds: set by scalar_classes */
 };
+
+/* Text this long is classified 16 bytes at a time, where SSE2 is */
+#define SC_SIMD_MIN 32
 
 #define C_ SC_CTRL
 #define LF (SC_BREAK | SC_LF)
@@ -304,12 +308,6 @@ static const uint8_t scalar_class[256] = {
 #undef FL
 #undef UN
 
-static unsigned scalar_classes(const char *s, size_t len) {
-    unsigned f = 0;
-    for (size_t i = 0; i < len; i++) f |= scalar_class[(uint8_t)s[i]];
-    return f;
-}
-
 /* Is there a character at s[i] that only a double-quoted scalar can hold,
  * escaped? Returns its length in bytes (0 if none) and its code point.
  * They are the C1 control characters, U+FEFF (a byte order mark), U+FFFE
@@ -333,16 +331,13 @@ static size_t escaped_char(const char *s, size_t len, size_t i, uint32_t *code) 
 }
 
 #if defined(__SSE2__)
-/* Where in b[0..16) a character escaped_char() finds starts, as a bit
- * mask, reading two bytes past them */
-static inline int escaped_starts(const char *b) {
 #define SPLAT(x) _mm_set1_epi8((char)(x))
 #define EQ(a, b) _mm_cmpeq_epi8(a, b)
+#define OR(a, b) _mm_or_si128(a, b)
 #define AND(a, b) _mm_and_si128(a, b)
-    __m128i v0 = _mm_loadu_si128((const __m128i *)b);
-    if (!_mm_movemask_epi8(v0)) return 0;   /* ASCII */
-    __m128i v1 = _mm_loadu_si128((const __m128i *)(b + 1));
-    __m128i v2 = _mm_loadu_si128((const __m128i *)(b + 2));
+/* Where in v0 a character escaped_char() finds starts, given the 16
+ * bytes from one (v1) and two (v2) bytes on, as a mask of 0xFF bytes */
+static inline __m128i escaped_mask(__m128i v0, __m128i v1, __m128i v2) {
     __m128i ef = EQ(v0, SPLAT(0xEF));
     __m128i c1 = AND(EQ(v0, SPLAT(0xC2)), EQ(AND(v1, SPLAT(0xE0)), SPLAT(0x80)));   /* C2 80-9F */
     __m128i ls = AND(AND(EQ(v0, SPLAT(0xE2)), EQ(v1, SPLAT(0x80))),
@@ -350,47 +345,99 @@ static inline int escaped_starts(const char *b) {
     __m128i bom = AND(AND(ef, EQ(v1, SPLAT(0xBB))), EQ(v2, SPLAT(0xBF)));          /* EF BB BF */
     __m128i nc = AND(AND(ef, EQ(v1, SPLAT(0xBF))),
                      EQ(AND(v2, SPLAT(0xFE)), SPLAT(0xBE)));                       /* EF BF BE-BF */
-    return _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(c1, ls), _mm_or_si128(bom, nc)));
-#undef SPLAT
-#undef EQ
-#undef AND
+    return OR(OR(c1, ls), OR(bom, nc));
+}
+
+/* The same for b[0..16), reading two bytes past them, as a bit mask */
+static inline int escaped_starts(const char *b) {
+    return _mm_movemask_epi8(escaped_mask(_mm_loadu_si128((const __m128i *)b),
+                                          _mm_loadu_si128((const __m128i *)(b + 1)),
+                                          _mm_loadu_si128((const __m128i *)(b + 2))));
+}
+
+/* Bytes under 0x20 */
+static inline __m128i below_space(__m128i v) {
+    return EQ(_mm_min_epu8(v, SPLAT(0x1F)), v);
 }
 #endif
 
-/* The first character escaped_char() finds in s[from..len): its offset
- * (len if none), with its length and code point. With SSE2, 16 starting
- * bytes at a time, each with the two after it: text full of other UTF-8
- * (CJK punctuation, typographic quotes) has a C2, E2 or EF lead byte every
- * few characters, so only a whole match may branch. */
-static size_t next_escaped_char(const char *s, size_t from, size_t len, size_t *w, uint32_t *code) {
-    size_t i = from;
-#if defined(__SSE2__)
-    int m = 0;
-    for (; i + 18 <= len; i += 16)
-        if ((m = escaped_starts(s + i))) break;
-    if (!m && i < len) {
-        /* the last 17 bytes or fewer, copied with zeros after them */
-        char pad[48] = { 0 };
-        memcpy(pad, s + i, len - i);
-        if (!(m = escaped_starts(pad)) && len - i > 16 && (m = escaped_starts(pad + 16))) i += 16;
-    }
-    if (!m) return len;
-    i += (size_t)__builtin_ctz((unsigned)m);
-    *w = escaped_char(s, len, i, code);
-    return i;
-#else
-    for (; i < len; i++)
-        if ((uint8_t)s[i] >= 0xC2 && (*w = escaped_char(s, len, i, code))) return i;
-    return len;
-#endif
-}
-
-/* Does `s` hold a character escaped_char() finds? `f` is
- * scalar_classes(s, len). */
-static bool has_escaped_char(const char *s, size_t len, unsigned f) {
-    size_t w;
+/* Is there a character escaped_char() finds in s[from..len)? */
+NOINLINE bool has_escaped_char(const char *s, size_t from, size_t len) {
     uint32_t code;
-    return (f & SC_UNI) && next_escaped_char(s, 0, len, &w, &code) < len;
+    for (size_t i = from; i < len; i++)
+        if ((scalar_class[(uint8_t)s[i]] & SC_UNI) && escaped_char(s, len, i, &code))
+            return true;
+    return false;
+}
+
+/* The classes of s[from..len), a byte at a time, with SC_ESC */
+static inline unsigned scalar_classes_bytes(const char *s, size_t from, size_t len) {
+    unsigned f = 0;
+    for (size_t i = from; i < len; i++) f |= scalar_class[(uint8_t)s[i]];
+    /* rare: a C2, E2 or EF lead byte */
+    if ((f & SC_UNI) && has_escaped_char(s, from, len)) f |= SC_ESC;
+    return f;
+}
+
+#if defined(__SSE2__)
+/* The first character escaped_char() finds in s[from..len): its offset,
+ * or len. 16 starting bytes at a time, each with the two after it */
+static size_t next_escaped_char(const char *s, size_t from, size_t len) {
+    size_t i = from;
+    for (; i + 18 <= len; i += 16) {
+        int m = escaped_starts(s + i);
+        if (m) return i + (size_t)__builtin_ctz((unsigned)m);
+    }
+    uint32_t code;
+    for (; i < len; i++)
+        if ((scalar_class[(uint8_t)s[i]] & SC_UNI) && escaped_char(s, len, i, &code)) return i;
+    return len;
+}
+
+/* The classes of s[0..len), len at least 16, 16 bytes at a time: each
+ * class kept as a mask, without a branch; an escaped character looked for
+ * afterwards, if there was a byte one could start with. Not inlined: its
+ * registers would cost every short scalar. */
+NOINLINE unsigned scalar_classes_long(const char *s, size_t len) {
+    __m128i ctrl = _mm_setzero_si128(), lf = ctrl, cr = ctrl, colon = ctrl, hash = ctrl,
+            flow = ctrl, lead = ctrl;
+    size_t i = 0;
+    for (; i + 16 <= len; i += 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+        __m128i n = EQ(v, SPLAT('\n'));
+        /* below 0x20 but tab and \n, and DEL */
+        ctrl = OR(ctrl, OR(_mm_andnot_si128(OR(n, EQ(v, SPLAT('\t'))), below_space(v)),
+                           EQ(v, SPLAT(0x7F))));
+        lf = OR(lf, n);
+        cr = OR(cr, EQ(v, SPLAT('\r')));
+        colon = OR(colon, EQ(v, SPLAT(':')));
+        hash = OR(hash, EQ(v, SPLAT('#')));
+        /* [ and { are 0x7B with 0x20 set, ] and } 0x7D */
+        __m128i w = OR(v, SPLAT(0x20));
+        flow = OR(flow, OR(EQ(v, SPLAT(',')), OR(EQ(w, SPLAT(0x7B)), EQ(w, SPLAT(0x7D)))));
+        lead = OR(lead, OR(EQ(v, SPLAT(0xC2)), OR(EQ(v, SPLAT(0xE2)), EQ(v, SPLAT(0xEF)))));
+    }
+    unsigned f = 0;
+    for (size_t j = i; j < len; j++) f |= scalar_class[(uint8_t)s[j]];
+    if (_mm_movemask_epi8(ctrl)) f |= SC_CTRL;
+    if (_mm_movemask_epi8(lf)) f |= SC_BREAK | SC_LF;
+    if (_mm_movemask_epi8(cr)) f |= SC_BREAK;
+    if (_mm_movemask_epi8(colon)) f |= SC_COLON;
+    if (_mm_movemask_epi8(hash)) f |= SC_HASH;
+    if (_mm_movemask_epi8(flow)) f |= SC_FLOW;
+    if (_mm_movemask_epi8(lead)) f |= SC_UNI;
+    if ((f & SC_UNI) && next_escaped_char(s, 0, len) < len) f |= SC_ESC;
+    return f;
+}
+#endif
+
+/* The classes of all of s, with SC_ESC and without SC_UNI (which marks
+ * bytes, for escaped_char) */
+static unsigned scalar_classes(const char *s, size_t len) {
+#if defined(__SSE2__)
+    if (len >= SC_SIMD_MIN) return scalar_classes_long(s, len) & ~(unsigned)SC_UNI;
+#endif
+    return scalar_classes_bytes(s, 0, len) & ~(unsigned)SC_UNI;
 }
 
 /* Could this text be misread if emitted plain? Only syntax is considered
@@ -447,8 +494,7 @@ static bool needs_quoting(const char *s, size_t len, bool flow_ctx, unsigned f) 
  * starts with a space: that would need an indentation indicator. `f` is
  * scalar_classes(s, len). */
 static bool literal_ok(const char *s, size_t len, unsigned f) {
-    if (f & SC_CTRL) return false;
-    if (has_escaped_char(s, len, f)) return false;
+    if (f & (SC_CTRL | SC_ESC)) return false;
     size_t i = 0;
     while (i < len && s[i] == '\n') i++;
     return !(i < len && s[i] == ' ');
@@ -477,13 +523,12 @@ static oyl_scalar_style choose_style(oyl_scalar_style requested,
     /* single quotes fold line breaks and can't escape: keep the value
      * exact with double quotes */
     if (requested == OYL_SCALAR_SINGLE_QUOTED)
-        return (f & (SC_BREAK | SC_CTRL)) || has_escaped_char(val, len, f)
-                   ? OYL_SCALAR_DOUBLE_QUOTED : requested;
+        return f & (SC_BREAK | SC_CTRL | SC_ESC) ? OYL_SCALAR_DOUBLE_QUOTED : requested;
 
     /* PLAIN requested — auto-detect */
     if (len == 0 && !is_str_tag(tag))
         return OYL_SCALAR_PLAIN;              /* empty (null) node */
-    if ((f & (SC_CTRL | SC_LF)) || has_escaped_char(val, len, f))
+    if (f & (SC_CTRL | SC_LF | SC_ESC))
         return OYL_SCALAR_DOUBLE_QUOTED;      /* control characters, line feeds */
     if (!needs_quoting(val, len, flow_ctx, f)) {
         if (is_str_tag(tag) && (is_yaml_keyword(val, len) || looks_like_number(val, len)))
@@ -508,66 +553,20 @@ static oyl_status emit_plain(oyl_emitter *e, const char *s, size_t len) {
 static oyl_status emit_single_quoted(oyl_emitter *e, const char *s, size_t len) {
     oyl_status st = buf_put(e, '\'');
     for (size_t i = 0; i < len && st == OYL_OK;) {
-        size_t n = len - i < CHUNK ? len - i : CHUNK;
-        if ((st = buf_ensure(e, 2 * n)) != OYL_OK) break;
-        char *o = e->buf + e->len;
-        for (size_t end = i + n; i < end; i++) {
-            if (s[i] == '\'') *o++ = '\'';   /* '' */
-            *o++ = s[i];
-        }
-        e->len = (size_t)(o - e->buf);
+        /* the text through the next quote, which is then doubled */
+        const char *q = memchr(s + i, '\'', len - i);
+        size_t run = q ? (size_t)(q - s) + 1 - i : len - i;
+        st = buf_puts(e, s + i, run);
+        if (q && st == OYL_OK) st = buf_put(e, '\'');
+        i += run;
     }
     return st == OYL_OK ? buf_put(e, '\'') : st;
 }
 
-/* Write s[0..len) escaped for double quotes: all but the characters
- * escaped_char() finds, which emit_double_quoted takes apart. `*bytes`
- * gets every byte or'ed together: under 0x80, there are none. */
-static oyl_status emit_dq_run(oyl_emitter *e, const char *s, size_t len, unsigned *bytes) {
+/* The escape for a character escaped_char() finds, written at `o`: \N, \L
+ * and \P, \xHH for the C1 controls, \uHHHH for the rest */
+static char *put_escape(char *o, uint32_t code) {
     static const char hex[] = "0123456789ABCDEF";
-    oyl_status st = OYL_OK;
-    unsigned all = 0;
-    for (size_t i = 0; i < len && st == OYL_OK;) {
-        size_t n = len - i < CHUNK ? len - i : CHUNK;
-        if ((st = buf_ensure(e, 4 * n)) != OYL_OK) break;   /* \xHH */
-        char *o = e->buf + e->len;
-        for (size_t end = i + n; i < end; i++) {
-            uint8_t c = (uint8_t)s[i];
-            all |= c;
-            if (c >= 0x20 && c != 0x7F && c != '\\' && c != '"') {
-                *o++ = (char)c;
-                continue;
-            }
-            *o++ = '\\';
-            switch (c) {
-            case '\\': *o++ = '\\'; break;
-            case '"':  *o++ = '"'; break;
-            case '\n': *o++ = 'n'; break;
-            case '\r': *o++ = 'r'; break;
-            case '\t': *o++ = 't'; break;
-            case '\0': *o++ = '0'; break;
-            case '\a': *o++ = 'a'; break;
-            case '\b': *o++ = 'b'; break;
-            default:   /* other control characters and DEL */
-                *o++ = 'x';
-                *o++ = hex[c >> 4];
-                *o++ = hex[c & 15];
-                break;
-            }
-        }
-        e->len = (size_t)(o - e->buf);
-    }
-    *bytes = all;
-    return st;
-}
-
-/* The escape for a character escaped_char() finds: \N, \L and \P, \xHH for
- * the C1 controls, \uHHHH for the rest */
-static oyl_status emit_escape(oyl_emitter *e, uint32_t code) {
-    static const char hex[] = "0123456789ABCDEF";
-    oyl_status st = buf_ensure(e, 6);
-    if (st != OYL_OK) return st;
-    char *o = e->buf + e->len;
     *o++ = '\\';
     if (code == 0x85 || code == 0x2028 || code == 0x2029) {
         *o++ = code == 0x85 ? 'N' : code == 0x2028 ? 'L' : 'P';
@@ -579,29 +578,88 @@ static oyl_status emit_escape(oyl_emitter *e, uint32_t code) {
         *o++ = 'u';
         for (int sh = 12; sh >= 0; sh -= 4) *o++ = hex[(code >> sh) & 15];
     }
-    e->len = (size_t)(o - e->buf);
-    return OYL_OK;
+    return o;
 }
 
-static oyl_status emit_double_quoted(oyl_emitter *e, const char *s, size_t len) {
-    oyl_status st = buf_put(e, '"');
-    if (st != OYL_OK) return st;
-    /* most text has none of the characters escaped_char() finds: written
-     * as it is, then looked for if there's anything but ASCII */
-    size_t start = e->len, w = 0;
-    uint32_t code = 0;
-    unsigned bytes;
-    st = emit_dq_run(e, s, len, &bytes);
-    size_t at = st == OYL_OK && bytes >= 0x80 ? next_escaped_char(s, 0, len, &w, &code) : len;
-    if (at < len) {
-        e->len = start;   /* written again, taken apart */
-        for (size_t from = 0; st == OYL_OK;) {
-            st = emit_dq_run(e, s + from, at - from, &bytes);
-            if (st != OYL_OK || at == len) break;
-            st = emit_escape(e, code);
-            from = at + w;
-            at = next_escaped_char(s, from, len, &w, &code);
+/* Write the escape for s[*i], a byte double quotes can't hold as it is
+ * or the start of a character escaped_char() finds, at `o`; or, for a
+ * lead byte of no such character, the byte. Moves *i past it. */
+static char *put_dq_special(char *o, const char *s, size_t len, size_t *i) {
+    static const char hex[] = "0123456789ABCDEF";
+    uint8_t c = (uint8_t)s[*i];
+    if (c >= 0x80) {   /* C2, E2 or EF */
+        uint32_t code;
+        size_t w = escaped_char(s, len, *i, &code);
+        if (!w) {
+            *o++ = (char)c;
+            *i += 1;
+            return o;
         }
+        *i += w;
+        return put_escape(o, code);
+    }
+    *i += 1;
+    *o++ = '\\';
+    switch (c) {
+    case '\\': *o++ = '\\'; break;
+    case '"':  *o++ = '"'; break;
+    case '\n': *o++ = 'n'; break;
+    case '\r': *o++ = 'r'; break;
+    case '\t': *o++ = 't'; break;
+    case '\0': *o++ = '0'; break;
+    case '\a': *o++ = 'a'; break;
+    case '\b': *o++ = 'b'; break;
+    default:   /* other control characters and DEL */
+        *o++ = 'x';
+        *o++ = hex[c >> 4];
+        *o++ = hex[c & 15];
+        break;
+    }
+    return o;
+}
+
+NOINLINE oyl_status emit_double_quoted(oyl_emitter *e, const char *s, size_t len) {
+    oyl_status st = buf_put(e, '"');
+    for (size_t i = 0; i < len && st == OYL_OK;) {
+        size_t n = len - i < CHUNK ? len - i : CHUNK;
+        /* \xHH for each byte, and a \uHHHH begun at the last one */
+        if ((st = buf_ensure(e, 4 * n + 2)) != OYL_OK) break;
+        char *o = e->buf + e->len;
+        size_t end = i + n;
+#if defined(__SSE2__)
+        /* 16 bytes at a time, each block up to the first byte that needs
+         * an escape (an escaped character's two bytes after read too) */
+        while (i + 16 <= end && i + 18 <= len) {
+            __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+            int m = _mm_movemask_epi8(OR(OR(below_space(v), EQ(v, SPLAT(0x7F))),
+                                         OR(EQ(v, SPLAT('\\')), EQ(v, SPLAT('"')))));
+            if (_mm_movemask_epi8(v)) m |= escaped_starts(s + i);
+            if (!m) {
+                _mm_storeu_si128((__m128i *)o, v);
+                o += 16;
+                i += 16;
+                continue;
+            }
+            size_t k = (size_t)__builtin_ctz((unsigned)m);
+            memcpy(o, s + i, k);
+            o += k;
+            i += k;
+            o = put_dq_special(o, s, len, &i);
+        }
+#endif
+        while (i < end) {
+            uint8_t c = (uint8_t)s[i];
+            if ((uint8_t)(c - 0x20) < 0x5F && c != '\\' && c != '"') {   /* ASCII but controls and DEL */
+                *o++ = (char)c;
+                i++;
+            } else if (c >= 0x80 && !(scalar_class[c] & SC_UNI)) {
+                *o++ = (char)c;
+                i++;
+            } else {
+                o = put_dq_special(o, s, len, &i);
+            }
+        }
+        e->len = (size_t)(o - e->buf);
     }
     return st == OYL_OK ? buf_put(e, '"') : st;
 }
@@ -625,8 +683,8 @@ static oyl_status emit_block_scalar(oyl_emitter *e, const char *s, size_t len,
     /* body lines, each ending in a line break */
     size_t pos = 0;
     while (pos < body) {
-        size_t eol = pos;
-        while (eol < body && s[eol] != '\n') eol++;
+        const char *nl = memchr(s + pos, '\n', body - pos);
+        size_t eol = nl ? (size_t)(nl - s) : body;
         if (eol > pos) {
             st = buf_indent(e, indent);
             if (st != OYL_OK) return st;

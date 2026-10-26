@@ -46,6 +46,7 @@ struct oyl_scanner {
 
     /* state */
     int          flow_level;
+    oyl_status   failed;    /* the first error, for oyl_scan_next() */
     ptrdiff_t    indent;
     indent_stack indents;
     bool         stream_started;
@@ -381,24 +382,27 @@ static void indent_pop(oyl_scanner *s) {
 
 /* ── Token constructors ──────────────────────────────────── */
 
-static oyl_token tok_simple(oyl_token_type type, oyl_mark start, oyl_mark end) {
-    return (oyl_token){
-        .type  = type,
-        .value = OYL_STR_NULL,
-        .start = start,
-        .end   = end,
-    };
+/* Tokens are written field by field through the caller's pointer, never
+ * built as a whole value and assigned: GCC may stage such an 80-byte value
+ * on the stack and copy it with `rep movs`, which is microcoded. After an
+ * unrelated one-line change it did so on the ':' path, and block YAML
+ * parsed 10-15% slower. */
+static inline void tok_set(oyl_token *tok, oyl_token_type type, oyl_str value,
+                           oyl_scalar_style style, oyl_mark start, oyl_mark end) {
+    tok->type         = type;
+    tok->value        = value;
+    tok->scalar_style = style;
+    tok->start        = start;
+    tok->end          = end;
 }
 
-static oyl_token tok_scalar(oyl_str value, oyl_scalar_style style,
-                            oyl_mark start, oyl_mark end) {
-    return (oyl_token){
-        .type         = OYL_TOK_SCALAR,
-        .value        = value,
-        .scalar_style = style,
-        .start        = start,
-        .end          = end,
-    };
+static inline void tok_simple(oyl_token *tok, oyl_token_type type, oyl_mark start, oyl_mark end) {
+    tok_set(tok, type, OYL_STR_NULL, OYL_SCALAR_PLAIN, start, end);
+}
+
+static inline void tok_scalar(oyl_token *tok, oyl_str value, oyl_scalar_style style,
+                              oyl_mark start, oyl_mark end) {
+    tok_set(tok, OYL_TOK_SCALAR, value, style, start, end);
 }
 
 static bool maybe_unroll_indents(oyl_scanner *s, ptrdiff_t col) {
@@ -575,20 +579,15 @@ static oyl_status scan_plain_scalar(oyl_scanner *s, oyl_token *tok) {
                 break;
             }
 
-            /* check for indicators that end the scalar */
+            /* check for indicators that end the scalar. Only ": ", "#" and
+             * a document marker do: a line indented enough to continue the
+             * scalar may start with any other indicator (YAML 1.2, 7.3.3:
+             * only a plain scalar's first character is restricted). So
+             * "a\n- b", "a\n&b" and "[a\n? b]" are "a - b", "a &b" and
+             * ["a ? b"]. A line at or below a block collection's indent,
+             * where "- " or "&" could start a node, failed the indentation
+             * check above */
             uint8_t nc = PEEK(s);
-            /* - and ? only start block entries at indent levels where
-             * a new block collection could begin (at or below current indent).
-             * On deeper continuation lines, they're just content.
-             * At top level (indent < 0), always terminate. */
-            if ((nc == '-' || nc == '?') &&
-                (s->indent < 0 || next_indent <= s->indent)) {
-                uint8_t after = PEEK_AT(s, 1);
-                if (oyl_is_blank_or_break(after) || after == 0) {
-                    s->pos = save; s->line = save_line; s->col = save_col;
-                    break;
-                }
-            }
             /* : followed by whitespace always ends (it introduces a mapping value) */
             if (nc == ':') {
                 uint8_t after = PEEK_AT(s, 1);
@@ -598,15 +597,6 @@ static oyl_status scan_plain_scalar(oyl_scanner *s, oyl_token *tok) {
                 }
             }
             if (nc == '#') {
-                s->pos = save; s->line = save_line; s->col = save_col;
-                break;
-            }
-            /* & and * could be anchors/aliases — they terminate the
-             * scalar only at indent levels where a new node could start
-             * (at or below current indent). On deeper continuation lines
-             * they're just plain text. At top level, terminate at col 0. */
-            if ((nc == '&' || nc == '*') &&
-                next_indent <= s->indent + (s->indent < 0 ? 1 : 0)) {
                 s->pos = save; s->line = save_line; s->col = save_col;
                 break;
             }
@@ -655,10 +645,10 @@ static oyl_status scan_plain_scalar(oyl_scanner *s, oyl_token *tok) {
     if (in_buf) {
         buf[out] = '\0';
         note_node(s, start, end.offset);
-        *tok = tok_scalar((oyl_str){buf, out}, OYL_SCALAR_PLAIN, start, end);
+        tok_scalar(tok, (oyl_str){buf, out}, OYL_SCALAR_PLAIN, start, end);
     } else {
         note_node(s, start, end.offset);
-        *tok = tok_scalar((oyl_str){single_start, single_len}, OYL_SCALAR_PLAIN, start, end);
+        tok_scalar(tok, (oyl_str){single_start, single_len}, OYL_SCALAR_PLAIN, start, end);
     }
     return OYL_OK;
 
@@ -683,7 +673,7 @@ static oyl_status scan_single_quoted(oyl_scanner *s, oyl_token *tok) {
             s->last_token_col = (ptrdiff_t)start.col - 1;
             s->last_was_quoted = true;
             note_node(s, start, s->pos);
-            *tok = tok_scalar(val, OYL_SCALAR_SINGLE_QUOTED, start, mark(s));
+            tok_scalar(tok, val, OYL_SCALAR_SINGLE_QUOTED, start, mark(s));
             return OYL_OK;
         }
     }
@@ -755,7 +745,7 @@ static oyl_status scan_single_quoted(oyl_scanner *s, oyl_token *tok) {
     s->last_token_col = (ptrdiff_t)start.col - 1;
     s->last_was_quoted = true;
     note_node(s, start, s->pos);
-    *tok = tok_scalar((oyl_str){buf, out}, OYL_SCALAR_SINGLE_QUOTED, start, mark(s));
+    tok_scalar(tok, (oyl_str){buf, out}, OYL_SCALAR_SINGLE_QUOTED, start, mark(s));
     return OYL_OK;
 
     #undef SQ_ENSURE
@@ -775,7 +765,7 @@ static oyl_status scan_double_quoted(oyl_scanner *s, oyl_token *tok) {
             s->last_token_col = (ptrdiff_t)start.col - 1;
             s->last_was_quoted = true;
             note_node(s, start, s->pos);
-            *tok = tok_scalar(val, OYL_SCALAR_DOUBLE_QUOTED, start, mark(s));
+            tok_scalar(tok, val, OYL_SCALAR_DOUBLE_QUOTED, start, mark(s));
             return OYL_OK;
         }
     }
@@ -955,7 +945,7 @@ static oyl_status scan_double_quoted(oyl_scanner *s, oyl_token *tok) {
     s->last_token_col = (ptrdiff_t)start.col - 1;
     s->last_was_quoted = true;
     note_node(s, start, s->pos);
-    *tok = tok_scalar((oyl_str){buf, out}, OYL_SCALAR_DOUBLE_QUOTED, start, mark(s));
+    tok_scalar(tok, (oyl_str){buf, out}, OYL_SCALAR_DOUBLE_QUOTED, start, mark(s));
     return OYL_OK;
 }
 
@@ -981,12 +971,7 @@ static oyl_status scan_tag(oyl_scanner *s, oyl_token *tok) {
         size_t len = BUF_AT(s) - tag_start;
         s->last_token_col = (ptrdiff_t)start.col - 1;
         note_props(s, start, s->pos);
-        *tok = (oyl_token){
-            .type  = OYL_TOK_TAG,
-            .value = {tag_start, len},
-            .start = start,
-            .end   = mark(s),
-        };
+        tok_set(tok, OYL_TOK_TAG, (oyl_str){tag_start, len}, OYL_SCALAR_PLAIN, start, mark(s));
         return OYL_OK;
     }
 
@@ -1000,12 +985,7 @@ static oyl_status scan_tag(oyl_scanner *s, oyl_token *tok) {
     size_t len = BUF_AT(s) - tag_start;
     s->last_token_col = (ptrdiff_t)start.col - 1;
     note_props(s, start, s->pos);
-    *tok = (oyl_token){
-        .type  = OYL_TOK_TAG,
-        .value = {tag_start, len},
-        .start = start,
-        .end   = mark(s),
-    };
+    tok_set(tok, OYL_TOK_TAG, (oyl_str){tag_start, len}, OYL_SCALAR_PLAIN, start, mark(s));
     return OYL_OK;
 }
 
@@ -1044,12 +1024,8 @@ static oyl_status scan_anchor_or_alias(oyl_scanner *s, oyl_token *tok) {
     s->last_token_col = (ptrdiff_t)start.col - 1;
     if (!is_anchor) note_node(s, start, s->pos);
     else note_props(s, start, s->pos);
-    *tok = (oyl_token){
-        .type  = is_anchor ? OYL_TOK_ANCHOR : OYL_TOK_ALIAS,
-        .value = {name_start, name_len},
-        .start = start,
-        .end   = mark(s),
-    };
+    tok_set(tok, is_anchor ? OYL_TOK_ANCHOR : OYL_TOK_ALIAS, (oyl_str){name_start, name_len},
+            OYL_SCALAR_PLAIN, start, mark(s));
     return OYL_OK;
 }
 
@@ -1122,7 +1098,24 @@ oyl_scanner *oyl_scanner_new(const char *input, size_t len, oyl_arena *a) {
 
 
 oyl_status oyl_scan_next(oyl_scanner *s, const oyl_token **tok) {
-    oyl_status st = oyl_scan_token(s, &s->out_tok);
+    /* an error is final: going on from where it stopped would read the
+     * rest of a bad token as new ones (the parser, which calls
+     * oyl_scan_token, keeps the first error itself) */
+    oyl_status st = s->failed ? s->failed : oyl_scan_token(s, &s->out_tok);
+    /* In a flow collection, a ':' right before '[' or '{', not after a
+     * quoted key, is neither a value indicator nor part of a plain scalar
+     * ("{a:[1]}"): oyl_scan_token gives an empty scalar there without
+     * moving on, which the parser reports as an error. Here it is one, or
+     * the tokens would repeat it forever. */
+    if (st == OYL_OK && s->out_tok.type == OYL_TOK_SCALAR && s->out_tok.value.len == 0 &&
+        s->out_tok.scalar_style == OYL_SCALAR_PLAIN &&
+        s->out_tok.end.offset == s->out_tok.start.offset) {
+        snprintf(s->error_msg, sizeof(s->error_msg), "%s",
+                 "':' must be followed by a space before a flow collection");
+        s->error_mark = s->out_tok.start;
+        st = OYL_ERR_SCAN;
+    }
+    if (st != OYL_OK) s->failed = st;
     *tok = st == OYL_OK ? &s->out_tok : NULL;
     return st;
 }
@@ -1139,7 +1132,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
     /* stream start */
     if (!s->stream_started) {
         s->stream_started = true;
-        *tok = tok_simple(OYL_TOK_STREAM_START, mark(s), mark(s));
+        tok_simple(tok, OYL_TOK_STREAM_START, mark(s), mark(s));
         return OYL_OK;
     }
 
@@ -1155,10 +1148,10 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
             s->stream_ended = true;
             /* unwind all indents */
             maybe_unroll_indents(s, -1);
-            *tok = tok_simple(OYL_TOK_STREAM_END, mark(s), mark(s));
+            tok_simple(tok, OYL_TOK_STREAM_END, mark(s), mark(s));
             return OYL_OK;
         }
-        *tok = tok_simple(OYL_TOK_NONE, mark(s), mark(s));
+        tok_simple(tok, OYL_TOK_NONE, mark(s), mark(s));
         return OYL_OK;
     }
 
@@ -1177,7 +1170,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
     if (at_doc_indicator(s, '-')) {
         maybe_unroll_indents(s, -1);
         advance(s, 3);
-        *tok = tok_simple(OYL_TOK_DOC_START, start, mark(s));
+        tok_simple(tok, OYL_TOK_DOC_START, start, mark(s));
         return OYL_OK;
     }
     if (at_doc_indicator(s, '.')) {
@@ -1188,7 +1181,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
         while (k < s->len && (s->buf[k] == ' ' || s->buf[k] == '\t')) k++;
         if (k < s->len && s->buf[k] != '#' && !oyl_is_break((uint8_t)s->buf[k]))
             SCAN_ERROR(s, "content after document end marker '...'");
-        *tok = tok_simple(OYL_TOK_DOC_END, start, mark(s));
+        tok_simple(tok, OYL_TOK_DOC_END, start, mark(s));
         return OYL_OK;
     }
 
@@ -1199,12 +1192,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
         size_t len = oyl_scan_to_break(line_start, REMAINING(s));
         advance_cols(s, len);
         if (!AT_END(s) && !oyl_is_break(PEEK(s))) SCAN_ERROR(s, "control character in directive");
-        *tok = (oyl_token){
-            .type  = OYL_TOK_DIRECTIVE,
-            .value = {line_start, len},
-            .start = start,
-            .end   = mark(s),
-        };
+        tok_set(tok, OYL_TOK_DIRECTIVE, (oyl_str){line_start, len}, OYL_SCALAR_PLAIN, start, mark(s));
         return OYL_OK;
     }
 
@@ -1215,7 +1203,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
         if (!flow_push(s, false)) return OYL_ERR_MEMORY;
         s->flow_level++;
         advance(s, 1);
-        *tok = tok_simple(OYL_TOK_FLOW_SEQ_START, start, mark(s));
+        tok_simple(tok, OYL_TOK_FLOW_SEQ_START, start, mark(s));
         return OYL_OK;
     case ']': {
         oyl_mark open = flow_pop(s);
@@ -1223,7 +1211,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
         advance(s, 1);
         note_node(s, open, s->pos);
         s->last_was_quoted = true; /* allow ]:value like "key":value */
-        *tok = tok_simple(OYL_TOK_FLOW_SEQ_END, start, mark(s));
+        tok_simple(tok, OYL_TOK_FLOW_SEQ_END, start, mark(s));
         return OYL_OK;
     }
     case '{':
@@ -1231,7 +1219,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
         if (!flow_push(s, true)) return OYL_ERR_MEMORY;
         s->flow_level++;
         advance(s, 1);
-        *tok = tok_simple(OYL_TOK_FLOW_MAP_START, start, mark(s));
+        tok_simple(tok, OYL_TOK_FLOW_MAP_START, start, mark(s));
         return OYL_OK;
     case '}': {
         oyl_mark open = flow_pop(s);
@@ -1239,7 +1227,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
         advance(s, 1);
         note_node(s, open, s->pos);
         s->last_was_quoted = true; /* allow }:value like "key":value */
-        *tok = tok_simple(OYL_TOK_FLOW_MAP_END, start, mark(s));
+        tok_simple(tok, OYL_TOK_FLOW_MAP_END, start, mark(s));
         return OYL_OK;
     }
     case ',':
@@ -1247,7 +1235,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
         /* so does a ',' at its depth: the entry ended without a value */
         if (s->explicit_key && s->explicit_depth == s->flows_len) s->explicit_key = false;
         advance(s, 1);
-        *tok = tok_simple(OYL_TOK_FLOW_ENTRY, start, mark(s));
+        tok_simple(tok, OYL_TOK_FLOW_ENTRY, start, mark(s));
         return OYL_OK;
     }
 
@@ -1264,7 +1252,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
             if (col > s->indent && !indent_push(s, col)) return OYL_ERR_MEMORY;
             advance(s, 1);
             s->indicator_end = s->pos;
-            *tok = tok_simple(OYL_TOK_BLOCK_SEQ_ENTRY, start, mark(s));
+            tok_simple(tok, OYL_TOK_BLOCK_SEQ_ENTRY, start, mark(s));
             return OYL_OK;
         }
     }
@@ -1284,7 +1272,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
             s->indicator_end = s->pos;
             s->explicit_key = true;
             s->explicit_depth = s->flows_len;
-            *tok = tok_simple(OYL_TOK_BLOCK_MAP_KEY, start, mark(s));
+            tok_simple(tok, OYL_TOK_BLOCK_MAP_KEY, start, mark(s));
             return OYL_OK;
         }
     }
@@ -1295,7 +1283,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
             advance(s, 1);
             s->explicit_key = true;
             s->explicit_depth = s->flows_len;
-            *tok = tok_simple(OYL_TOK_BLOCK_MAP_KEY, start, mark(s));
+            tok_simple(tok, OYL_TOK_BLOCK_MAP_KEY, start, mark(s));
             return OYL_OK;
         }
     }
@@ -1342,7 +1330,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
             if (map_col > s->indent && !indent_push(s, map_col)) return OYL_ERR_MEMORY;
             advance(s, 1);
             s->indicator_end = s->pos;
-            *tok = tok_simple(OYL_TOK_BLOCK_MAP_VALUE, start, mark(s));
+            tok_simple(tok, OYL_TOK_BLOCK_MAP_VALUE, start, mark(s));
             return OYL_OK;
         }
         if (s->flow_level > 0 &&
@@ -1360,7 +1348,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
                 key_too_long(s, key_start(s)))
                 SCAN_ERROR(s, "an implicit key is at most 1024 characters");
             advance(s, 1);
-            *tok = tok_simple(OYL_TOK_BLOCK_MAP_VALUE, start, mark(s));
+            tok_simple(tok, OYL_TOK_BLOCK_MAP_VALUE, start, mark(s));
             return OYL_OK;
         }
     }
@@ -1686,7 +1674,7 @@ oyl_status oyl_scan_token(oyl_scanner *s, oyl_token *tok) {
         /* keep (chomp == 1): preserve all trailing newlines as-is */
 
         buf[out] = '\0';
-        *tok = tok_scalar((oyl_str){buf, out}, style, start, mark(s));
+        tok_scalar(tok, (oyl_str){buf, out}, style, start, mark(s));
         return OYL_OK;
     }
 
