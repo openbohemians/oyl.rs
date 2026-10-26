@@ -22,6 +22,10 @@ Two crates:
 oyl = "0.2"
 ```
 
+Oyl's C builds with GCC or Clang, so the crates work on Linux and macOS.
+Windows isn't supported yet: Microsoft's C compiler, which Rust uses there
+by default, can't compile it.
+
 ## Parsing
 
 ```rust
