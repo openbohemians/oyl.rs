@@ -57,7 +57,9 @@
 //! its own, and dialects ([`CustomDialect`]).
 //!
 //! With the `serde` feature, `oyl::from_str` and friends
-//! deserialize YAML into your types, from its tree (see the `de` module).
+//! deserialize YAML into your types, from its tree (see the `de` module),
+//! and `oyl::to_string` and friends write your types as YAML (the `ser`
+//! module).
 //!
 //! The C library is compiled from sources vendored in the `oyl-sys` crate,
 //! so nothing needs to be installed.
@@ -92,6 +94,12 @@ pub mod de;
 #[cfg(feature = "serde")]
 #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 pub use de::{from_node, from_reader, from_slice, from_slice_with, from_str, from_str_with};
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub mod ser;
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub use ser::{to_string, to_vec, to_writer, Serializer};
 
 // ── Positions, kinds and styles ─────────────────────────────
 
@@ -486,7 +494,8 @@ pub enum ErrorKind {
     /// A safety limit was exceeded: the event count, nesting depth, or
     /// alias and merge expansion. See [`Parser::max_events`].
     Limit,
-    /// The YAML doesn't fit the type it's deserialized into (serde).
+    /// The YAML doesn't fit the type it's deserialized into, or a value
+    /// failed to serialize (serde).
     Data,
     /// A status this version doesn't know.
     Other,

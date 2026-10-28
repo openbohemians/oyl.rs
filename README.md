@@ -9,8 +9,9 @@ Two crates:
 - **`oyl`**: the safe API. A pull parser whose events come from an iterator,
   documents as trees with lookups and typed values, dialects (YAML 1.2,
   YAML 1.1, go-yaml v2 as Kubernetes reads YAML), YAML to JSON, errors that
-  say where they happened, and an emitter that keeps documents' `%YAML`
-  and `%TAG` directives.
+  say where they happened, an emitter that keeps documents' `%YAML`
+  and `%TAG` directives, and, with the `serde` feature, reading YAML into
+  your types and writing them as YAML.
 - **`oyl-sys`**: the raw C declarations, mirroring `oyl.h`. It compiles Oyl
   from sources vendored in the crate, so nothing needs to be installed; a C
   compiler is enough.
@@ -110,7 +111,7 @@ back out as YAML.
 ## serde
 
 With the `serde` feature, `oyl::from_str` deserializes YAML into your
-types:
+types, and `oyl::to_string` writes them as YAML:
 
 ```toml
 [dependencies]
@@ -147,6 +148,34 @@ The YAML is read into a tree and deserialized from it:
   past 128 and alias bombs are errors, not stack overflows.
 - `from_node` deserializes any node of a tree you hold, so a stream's
   documents can be read one by one (`Parser::trees`), or part of one.
+
+- Bytes are read from a `!!binary` scalar's base64.
+
+`oyl::to_string` writes a value as a YAML 1.2 document, which reads back
+as the same data in YAML 1.2, YAML 1.1 and go-yaml v2 readers alike:
+
+```rust
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Container<'a> {
+    name: &'a str,
+    image: &'a str,
+    ports: Vec<u16>,
+}
+
+let yaml = oyl::to_string(&Container { name: "on", image: "nginx:1.27", ports: vec![80] })?;
+assert_eq!(yaml, "name: \"on\"\nimage: nginx:1.27\nports:\n  - 80\n");
+```
+
+- A string any of those readers would read as another type is quoted
+  (`"on"`, `"yes"`, `"y"`, `"017"`, `"1:30"`, `""`); text with line
+  breaks is a literal block (`|`).
+- A float always has a dot (`1.0`, `1.0e+20`), or is `.inf` or `.nan`.
+- Bytes are `!!binary`, `None` and `()` are `null`, and an enum is its
+  variant's name or a mapping with one key, as `from_str` reads them.
+- `to_vec` and `to_writer` write bytes. `Emitter::serialize` writes a
+  value as one node, for another style or several documents.
 
 On 848 public Kubernetes manifests, deserializing is 2.3x faster than
 serde_yaml 0.9 into a generic value (every node visited) and 4.2x faster

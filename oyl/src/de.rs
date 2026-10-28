@@ -26,6 +26,8 @@
 //!   order. A key written twice in a mapping is an error.
 //! - An enum is a string (a unit variant), a mapping with one key (the
 //!   variant and its content), or a node tagged `!Variant`.
+//! - Bytes are a `!!binary` scalar's base64, decoded, or any other
+//!   scalar's text.
 //! - Errors say where: the line and column of the node that didn't fit.
 //!
 //! Nesting deeper than 128 is an error, and so is expanding aliases far
@@ -46,6 +48,8 @@ use crate::{Dialect, Error, ErrorKind, Items, Node, NodeKind, Parser, Tree, Valu
 
 /// How deep collections may nest, aliases followed.
 const MAX_DEPTH: u32 = 128;
+
+const BINARY_TAG: &[u8] = b"tag:yaml.org,2002:binary";
 
 impl de::Error for Error {
     fn custom<T: fmt::Display>(msg: T) -> Self {
@@ -358,6 +362,10 @@ impl<'s, 'de, S: Source<'de>> de::Deserializer<'de> for De<'s, S> {
     fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         let de = self.target()?;
         let out = match de.node.kind() {
+            NodeKind::Scalar if de.node.tag() == Some(BINARY_TAG) => match crate::ser::unbase64(de.node.text()) {
+                Some(b) => visitor.visit_byte_buf(b),
+                None => Err(de::Error::custom("invalid base64 in !!binary")),
+            },
             NodeKind::Scalar => match de.src.borrow(de.node) {
                 Some(b) => visitor.visit_borrowed_bytes(b),
                 None => visitor.visit_bytes(de.node.text()),
