@@ -20,12 +20,11 @@ Two crates:
 
 ```toml
 [dependencies]
-oyl = "0.2"
+oyl = "0.3"
 ```
 
-Oyl's C builds with GCC or Clang, so the crates work on Linux and macOS.
-Windows isn't supported yet: Microsoft's C compiler, which Rust uses there
-by default, can't compile it.
+Oyl's C builds with GCC, Clang or MSVC, so the crates work on Linux, macOS
+and Windows.
 
 ## Parsing
 
@@ -115,7 +114,7 @@ types, and `oyl::to_string` writes them as YAML:
 
 ```toml
 [dependencies]
-oyl = { version = "0.2", features = ["serde"] }
+oyl = { version = "0.3", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
@@ -288,12 +287,12 @@ Oyl:
 
 ```sh
 scripts/sync-oyl.sh path/to/oyl          # the checkout's committed HEAD
-scripts/sync-oyl.sh path/to/oyl v1.2.0   # or a release tag
+scripts/sync-oyl.sh path/to/oyl v1.3.0   # or a release tag
 cargo test
 ```
 
 The script also sets the build metadata of `oyl-sys`'s version, the part
-after `+`, to the vendored Oyl version: `0.2.0+1.2.0` bundles Oyl 1.2.0.
+after `+`, to the vendored Oyl version: `0.3.0+1.3.0` bundles Oyl 1.3.0.
 crates.io won't take two versions that differ only there, so publishing
 newly vendored sources also needs a bump before the `+`.
 
