@@ -12,7 +12,7 @@ categories = ["parser-implementations", "encoding"]
 readme = "../README.md"
 
 [dependencies]
-oyl-sys = { version = "0.3.0", path = "../oyl-sys" }
+oyl-sys = { version = "0.4.0", path = "../oyl-sys" }
 serde = { version = "1", optional = true }
 
 [features]
