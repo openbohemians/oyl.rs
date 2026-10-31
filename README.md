@@ -248,6 +248,31 @@ let parser = Parser::new("b: yes\na: 0777\n")?;
 assert_eq!(parser.next_json(&JsonOptions::kubernetes())?, Some(r#"{"a":511,"b":true}"#));
 ```
 
+## Upgrading YAML 1.1 to 1.2
+
+`oyl::upgrade` makes a YAML 1.1 file read the same in YAML 1.2, rewriting
+only what a 1.2 reader would read otherwise and keeping every other byte:
+comments, layout, quoting, key order. Name the file's reader
+(`Dialect::yaml11()` for PyYAML and Ansible, `Dialect::goyaml2()` for
+go-yaml v2 and Kubernetes), and afterwards the file reads the same in it
+and in YAML 1.2:
+
+```rust
+use oyl::{Dialect, Upgrade};
+
+let (text, fixes) = oyl::upgrade("on: push\nenabled: yes\nmode: 0755\n",
+                                 &Upgrade::from(Dialect::yaml11()))?;
+assert_eq!(text, "\"on\": push\nenabled: true\nmode: !!int 0o755\n");
+for f in &fixes {
+    println!("{}:{} {} -> {}  {}", f.mark.line, f.mark.column, f.before, f.after, f.message);
+}
+```
+
+Values keep the reader's meaning (`yes` was true), keys their text (`on:`
+is a name); `keys_keep_value` and `values_keep_text` flip either. With
+`Upgrade::default()`, what PyYAML and go-yaml v2 read alike is fixed, and
+what they read otherwise is reported (`fixed` false), left for you.
+
 ## Emitting
 
 ```rust

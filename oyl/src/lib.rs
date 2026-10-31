@@ -84,7 +84,9 @@ pub use oyl_sys as sys;
 mod custom;
 mod scanner;
 mod tree;
+mod upgrade;
 pub use custom::{CustomDialect, CustomSchema, FloatFlags, IntFlags, SchemaBuilder, Syntax};
+pub use upgrade::{upgrade, Fix, FixKind, Upgrade};
 pub use scanner::{Scanner, Token, TokenKind, Tokens};
 pub use tree::{Items, Node, NodeKind, Pairs, Tree, Trees};
 
@@ -724,13 +726,13 @@ impl Dialect<'static> {
     /// merge: a document PyYAML reads gets the same values. Two
     /// exceptions: ints beyond 64 bits are text, and keys are equal as
     /// YAML has them, by tag and value, where Python's `==` also makes
-    /// `1`, `1.0` and `true` one key. The syntax is YAML 1.2's, but a
-    /// block scalar ending the input gets no final line feed, as in
-    /// libyaml. Malformed YAML that libyaml lets through stays an error,
-    /// such as a comment touching a closing quote or bracket or a block
-    /// scalar's header (`"a"#c`, `[a]#c`, `|#c`), or a quoted scalar or
-    /// flow collection whose later lines aren't indented past the block it
-    /// sits in.
+    /// `1`, `1.0` and `true` one key. The syntax is YAML 1.2's, with two
+    /// of libyaml's leniencies: a block scalar ending the input gets no
+    /// final line feed, and a quoted scalar's or flow collection's later
+    /// lines needn't be indented past the block it sits in. Other
+    /// malformed YAML that libyaml lets through stays an error, such as a
+    /// comment touching a closing quote or bracket or a block scalar's
+    /// header (`"a"#c`, `[a]#c`, `|#c`).
     pub fn yaml11() -> Self {
         Dialect::preset(unsafe { sys::oyl_dialect_yaml11() })
     }

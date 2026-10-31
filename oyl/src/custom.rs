@@ -135,6 +135,10 @@ flags! {
         /// for every document but one choosing a dialect given for its
         /// version or `%TAG !!` prefix (go-yaml v2).
         YAML11_ONLY = sys::OYL_SYNTAX_YAML11_ONLY;
+        /// A quoted scalar's or flow collection's later lines needn't be
+        /// indented past the block it sits in, and a tab may indent them:
+        /// `[a,\nb]` (libyaml, so PyYAML and go-yaml v2).
+        FLOW_INDENT = sys::OYL_SYNTAX_FLOW_INDENT;
         /// go-yaml v2's leniencies.
         GOYAML2 = sys::OYL_SYNTAX_GOYAML2;
     }

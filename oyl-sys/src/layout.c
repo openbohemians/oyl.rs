@@ -25,5 +25,8 @@ const size_t oyl_sys_layout[] = {
     offsetof(oyl_node_props, tag_len), offsetof(oyl_node_props, anchor),
     offsetof(oyl_node_props, anchor_len),
     sizeof(oyl_pair), offsetof(oyl_pair, key), offsetof(oyl_pair, value),
+    sizeof(oyl_fix), offsetof(oyl_fix, kind), offsetof(oyl_fix, mark),
+    offsetof(oyl_fix, before), offsetof(oyl_fix, after), offsetof(oyl_fix, fixed),
+    offsetof(oyl_fix, message),
 };
 const size_t oyl_sys_layout_len = sizeof oyl_sys_layout / sizeof oyl_sys_layout[0];

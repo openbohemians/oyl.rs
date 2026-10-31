@@ -225,8 +225,10 @@ pub const OYL_FLOAT_YAML11: c_uint = OYL_FLOAT_SPECIALS | OYL_FLOAT_NEED_DOT | O
 pub const OYL_SYNTAX_SQUOTE_ESCAPE: c_uint = 1 << 0;
 pub const OYL_SYNTAX_EOF_NO_BREAK: c_uint = 1 << 1;
 pub const OYL_SYNTAX_YAML11_ONLY: c_uint = 1 << 2;
+pub const OYL_SYNTAX_FLOW_INDENT: c_uint = 1 << 3;
 /// go-yaml v2's leniencies.
-pub const OYL_SYNTAX_GOYAML2: c_uint = OYL_SYNTAX_SQUOTE_ESCAPE | OYL_SYNTAX_EOF_NO_BREAK | OYL_SYNTAX_YAML11_ONLY;
+pub const OYL_SYNTAX_GOYAML2: c_uint =
+    OYL_SYNTAX_SQUOTE_ESCAPE | OYL_SYNTAX_EOF_NO_BREAK | OYL_SYNTAX_YAML11_ONLY | OYL_SYNTAX_FLOW_INDENT;
 
 /// How `<<` merge keys combine with the keys written in a mapping.
 pub type oyl_merge_order = c_uint;
@@ -315,6 +317,39 @@ pub struct oyl_pair {
 
 /// `oyl_node_entries` flag: a key written twice is an error.
 pub const OYL_ENTRIES_STRICT: c_uint = 1 << 0;
+
+// ── Upgrade ─────────────────────────────────────────────────
+
+/// What `oyl_upgrade` fixed, or found and left.
+pub type oyl_fix_kind = c_uint;
+pub const OYL_FIX_SCALAR: oyl_fix_kind = 1;
+pub const OYL_FIX_DIRECTIVE: oyl_fix_kind = 2;
+pub const OYL_FIX_ESCAPE: oyl_fix_kind = 3;
+pub const OYL_FIX_CHOMP: oyl_fix_kind = 4;
+pub const OYL_FIX_MERGE: oyl_fix_kind = 5;
+pub const OYL_FIX_INDENT: oyl_fix_kind = 6;
+
+/// One change, or one difference left as it was.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct oyl_fix {
+    pub kind: oyl_fix_kind,
+    /// Where, in the input.
+    pub mark: oyl_mark,
+    /// The input's text there.
+    pub before: oyl_str,
+    /// What replaced it (empty if removed, or left).
+    pub after: oyl_str,
+    /// False: reported only, the input left as it was.
+    pub fixed: bool,
+    /// What each reader reads, and what was done.
+    pub message: *const c_char,
+}
+
+/// `oyl_upgrade` options.
+pub const OYL_UPGRADE_KEYS_KEEP_VALUE: c_uint = 1 << 0;
+pub const OYL_UPGRADE_VALUES_KEEP_TEXT: c_uint = 1 << 1;
+pub const OYL_UPGRADE_TIMESTAMPS_TEXT: c_uint = 1 << 2;
 
 // ── Functions ───────────────────────────────────────────────
 
@@ -406,6 +441,9 @@ extern "C" {
 
     pub fn oyl_parse_json(p: *mut oyl_parser, schema: *const oyl_schema, flags: c_uint, json: *mut oyl_str) -> oyl_status;
 
+    pub fn oyl_upgrade(p: *mut oyl_parser, flags: c_uint, out: *mut oyl_str, fixes: *mut *const oyl_fix,
+                       nfixes: *mut usize) -> oyl_status;
+
     pub fn oyl_parse_tree(p: *mut oyl_parser, tree: *mut *mut oyl_tree) -> oyl_status;
     pub fn oyl_tree_free(t: *mut oyl_tree);
     pub fn oyl_tree_nodes(t: *const oyl_tree, count: *mut u32) -> *const oyl_node;
@@ -457,14 +495,14 @@ mod tests {
     use core::mem::{offset_of, size_of};
 
     extern "C" {
-        static oyl_sys_layout: [usize; 48];
+        static oyl_sys_layout: [usize; 55];
         static oyl_sys_layout_len: usize;
     }
 
     /// The Rust structs must have the C structs' sizes and field offsets.
     #[test]
     fn layout_matches_c() {
-        let rust: [usize; 48] = [
+        let rust: [usize; 55] = [
             size_of::<oyl_str>(), offset_of!(oyl_str, data), offset_of!(oyl_str, len),
             size_of::<oyl_mark>(), offset_of!(oyl_mark, offset), offset_of!(oyl_mark, line),
             offset_of!(oyl_mark, col),
@@ -486,6 +524,9 @@ mod tests {
             offset_of!(oyl_node_props, tag_len), offset_of!(oyl_node_props, anchor),
             offset_of!(oyl_node_props, anchor_len),
             size_of::<oyl_pair>(), offset_of!(oyl_pair, key), offset_of!(oyl_pair, value),
+            size_of::<oyl_fix>(), offset_of!(oyl_fix, kind), offset_of!(oyl_fix, mark),
+            offset_of!(oyl_fix, before), offset_of!(oyl_fix, after), offset_of!(oyl_fix, fixed),
+            offset_of!(oyl_fix, message),
         ];
         unsafe {
             assert_eq!(oyl_sys_layout_len, rust.len());
